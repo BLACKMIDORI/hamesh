@@ -24,6 +24,8 @@ rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-native-certs = "0.6"
 structopt = "0.3"
 tokio = { version = "1.27", features = ["full"] }
+serde_json = "1.0.48"
+serde = { version = "1.0.196", features = ["derive"] }
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "fmt",
@@ -35,3 +37,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 octets = "0.2.0"
 
 tracing-tree = { version = "0.2" }
+rand = "0.8.5"

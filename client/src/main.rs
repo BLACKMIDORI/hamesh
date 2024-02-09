@@ -1,39 +1,149 @@
-use std::sync::Arc;
-use std::net::SocketAddr;
+mod subscription_response;
+mod subscription_view_response;
+mod control_datagram;
+mod client;
 
-use futures::future;
-use structopt::StructOpt;
-use tokio::io::AsyncWriteExt;
+use std::{io, thread};
+use std::io::{Read, Write};
+use std::sync::Arc;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::str::FromStr;
+use std::time::Duration;
+use bytes::Buf;
+
+use futures::{future, Sink, TryFutureExt};
+// use structopt::StructOpt;
 use tracing::{error, info};
 
 use h3_quinn::quinn;
 use http::Uri;
 use quinn::Endpoint;
+use rand::Rng;
+use tokio::net::UdpSocket;
+use tokio::sync::Mutex;
+use tokio::time;
+use crate::client::establish_connection;
+use crate::subscription_view_response::SubscriptionPeer;
 
 static ALPN: &[u8] = b"h3";
 
-#[derive(StructOpt, Debug)]
-#[structopt(name = "server")]
-struct Opt {
-    #[structopt(name = "keylogfile", long)]
-    pub key_log_file: bool,
-
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    let socket = &std::net::UdpSocket::bind("[::]:0").unwrap();
+    let socket_copy = socket.try_clone().unwrap();
+    let mut client_endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+    client_endpoint.rebind(socket_copy).expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
-    let opt = Opt::from_args();
+    let subscription_response_str = http3get(&mut client_endpoint, "https://hamash-stun.blackmidori.com/subscription?version=1").await?;
+    let subscription_response = serde_json::from_str::<subscription_response::SubscriptionResponse>(&subscription_response_str).unwrap();
 
+    let input_result = tokio::spawn(read_peer_subscription());
+    let subscription_id = subscription_response.value.subscription_id;
+    print!("My subscription id: {}\n", subscription_id);
+    static mut ALREADY_CONNECTED: bool = false;
+    let mut client_clone = client_endpoint.clone();
+    tokio::join!(
+         async{
+            let result = async {
+                  let mut interval = time::interval(Duration::from_secs(1));
+        let mut stdout = io::stdout();
+        loop {
+                    unsafe{
+                    if ALREADY_CONNECTED{
+                        return Ok::<bool, ()>(false);
+                    }
+                    }
+            stdout.write(".".as_ref());
+            stdout.flush();
+            let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamash-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await;
+
+            match subscription_view_response_str_result {
+                Ok(subscription_view_response_str) => {
+                    let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
+                    if subscription_response.value.peers.is_empty() {
+                        break;
+                    } else if subscription_response.value.peers.len() == 2 {
+                        let peer_a = &subscription_response.value.peers[0];
+                        let peer_b = &subscription_response.value.peers[1];
+                                tokio::join!(connect_peers(socket,peer_a.clone(), peer_b.clone()));
+                        return Ok(true);
+                    }
+                }
+                Err(e) => {
+                    print!("Error polling subscription: {:?}", e)
+                }
+            }
+            interval.tick().await;
+        }
+        print!("Subscription timeout!\n");
+        return Ok(false);
+            }.await;
+            match result{
+                Ok(connected)=>unsafe{
+                    if connected{
+                        ALREADY_CONNECTED = true
+                    }
+                },
+                Err(..)=>{
+                    print!("Failed waiting peers to connect.")
+                }
+            }
+         },
+        async{
+
+    let subscription_id = input_result.await.unwrap().unwrap();
+            unsafe{
+
+    if  ALREADY_CONNECTED {
+        print!("already connected!")
+    } else {
+                    ALREADY_CONNECTED = true;
+        http3get(&mut client_endpoint, format!("https://hamash-stun.blackmidori.com/join/{subscription_id}?version=1").as_str()).await.unwrap();
+        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamash-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await.unwrap();
+
+        let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
+
+        if subscription_response.value.peers.len() < 2 {
+            print!("After we joined, we didn't find 2 peers in this subscription. It may be expired.")
+        } else {
+            let peer_a = &subscription_response.value.peers[0];
+            let peer_b = &subscription_response.value.peers[1];
+            tokio::join!(connect_peers(socket, peer_b,peer_a));
+        }
+    }
+            }
+        }
+    );
+
+    Ok(())
+}
+
+async fn connect_peers(socket: &std::net::UdpSocket, source_peer: &SubscriptionPeer, dest_peer: &SubscriptionPeer) {
+    let source_address;
+    let dest_address;
+    if source_peer.address.contains(".") {
+        source_address = SocketAddr::from_str(format!("{}:{}", source_peer.address, source_peer.port).as_str()).unwrap()
+    } else {
+        source_address = SocketAddr::from_str(format!("[{}]:{}", source_peer.address, source_peer.port).as_str()).unwrap()
+    }
+    if dest_peer.address.contains(".") {
+        dest_address = SocketAddr::from_str(format!("{}:{}", dest_peer.address, dest_peer.port).as_str()).unwrap()
+    } else {
+        dest_address = SocketAddr::from_str(format!("[{}]:{}", dest_peer.address, dest_peer.port).as_str()).unwrap()
+    }
+    establish_connection(socket.try_clone().unwrap(), source_address, dest_address).await;
+}
+
+
+async fn read_peer_subscription() -> Result<String, io::Error> {
+    print!("Enter a peer subscription id:\n");
+    Ok(io::stdin().lines().next().unwrap().unwrap())
+}
+
+
+async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, Box<dyn std::error::Error>> {
     // DNS lookup
-
-    let uri = "https://d3tlte2uy1nv5z.cloudfront.net/subscription?version=1".parse::<http::Uri>()?;
+    let uri = url.parse::<http::Uri>()?;
 
     if uri.scheme() != Some(&http::uri::Scheme::HTTPS) {
         Err("uri scheme must be 'https'")?;
@@ -66,12 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             error!("couldn't load any default trust roots: {}", e);
         }
     };
-    //
-    // // load certificate of CA who issues the server certificate
-    // // NOTE that this should be used for dev only
-    // if let Err(e) = roots.add(&rustls::Certificate(std::fs::read(opt.ca)?)) {
-    //     error!("failed to parse trust anchor: {}", e);
-    // }
 
     let mut tls_config = rustls::ClientConfig::builder()
         .with_safe_default_cipher_suites()
@@ -83,28 +187,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN.into()];
 
-    // optional debugging support
-    if opt.key_log_file {
-        // Write all Keys to a file if SSLKEYLOGFILE is set
-        // WARNING, we enable this for the example, you should think carefully about enabling in your own code
-        tls_config.key_log = Arc::new(rustls::KeyLogFile::new());
-    }
-
-    let mut client_endpoint = h3_quinn::quinn::Endpoint::client("[::]:0".parse().unwrap())?;
 
     let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
     client_endpoint.set_default_client_config(client_config);
 
-    run_client(&client_endpoint, addr, uri).await?;
+    let body = run_client(&client_endpoint, addr, uri).await;
 
     // wait for the connection to be closed before exiting
     client_endpoint.wait_idle().await;
 
-    Ok(())
+    body
 }
 
-async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri)->Result<(), Box<dyn std::error::Error>> {
-
+async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> Result<String, Box<dyn std::error::Error>> {
     let auth = uri.authority().ok_or("uri must have a host")?.clone();
 
     let conn = client_endpoint.connect(addr, auth.host())?.await?;
@@ -148,21 +243,28 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri)->Res
         let resp = stream.recv_response().await?;
 
         info!("response: {:?} {}", resp.version(), resp.status());
-        info!("headers: {:#?}", resp.headers());
+        // info!("headers: {:#?}", resp.headers());
 
+        let mut buffer = [0; 1024];
+        let mut buffer_size = 0;
         // `recv_data()` must be called after `recv_response()` for
         // receiving potential response body
         while let Some(mut chunk) = stream.recv_data().await? {
-            let mut out = tokio::io::stdout();
-            out.write_all_buf(&mut chunk).await?;
-            out.flush().await?;
+            let mut remaining = chunk.remaining();
+            while remaining > 0 {
+                buffer_size += remaining;
+                let bytes = chunk.copy_to_bytes(remaining);
+                bytes.reader().read(&mut buffer).unwrap();
+                remaining = chunk.remaining();
+            }
         }
 
-        Ok::<_, Box<dyn std::error::Error>>(())
+        let body = std::str::from_utf8(&buffer[..buffer_size]).unwrap().to_string();
+        Ok::<_, Box<dyn std::error::Error>>(body)
     };
 
     let (req_res, drive_res) = tokio::join!(request, drive);
-    req_res?;
+    let body = req_res?;
     drive_res?;
-    Ok(())
+    Ok(body)
 }
