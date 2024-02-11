@@ -3,6 +3,7 @@ mod subscription_view_response;
 mod control_datagram;
 mod client;
 mod stun_client;
+mod port_settings;
 
 use std::{io};
 use std::io::{Read};
@@ -42,6 +43,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:input|output) \d+:\d+/(?:tcp|udp))*$").unwrap();
     if !regex.is_match(joined.as_str()){
         show_help_message();
+        return Ok(());
+    }
+    if !joined.contains("--input") && !joined.contains("--output") {
+        print!("Provide at least one --input or --output argument");
         return Ok(());
     }
     let socket = &std::net::UdpSocket::bind("[::]:0").unwrap();
