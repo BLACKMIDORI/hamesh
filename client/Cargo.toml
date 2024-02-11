@@ -1,10 +1,10 @@
 [package]
-name = "hamash-client"
-version = "1.0.0"
+name = "hamesh_cli"
+version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "bootstrap"
+name = "hamesh_cli"
 path = "src/main.rs"
 
 [dependencies]
@@ -38,3 +38,6 @@ octets = "0.2.0"
 
 tracing-tree = { version = "0.2" }
 rand = "0.8.5"
+regex = "1.10.3"
+simple_logger = "4.3.3"
+log = "0.4.20"

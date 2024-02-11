@@ -2,60 +2,69 @@ mod subscription_response;
 mod subscription_view_response;
 mod control_datagram;
 mod client;
+mod stun_client;
 
-use std::{io, thread};
-use std::io::{Read, Write};
+use std::{io};
+use std::io::{Read};
 use std::sync::Arc;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{ SocketAddr};
 use std::str::FromStr;
 use std::time::Duration;
+use regex::Regex;
 use bytes::Buf;
 
-use futures::{future, Sink, TryFutureExt};
+use futures::{future};
 // use structopt::StructOpt;
-use tracing::{error, info};
+use log::{error, info, LevelFilter, warn};
 
 use h3_quinn::quinn;
 use http::Uri;
 use quinn::Endpoint;
-use rand::Rng;
-use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use simple_logger::SimpleLogger;
 use tokio::time;
 use crate::client::establish_connection;
+use crate::stun_client::subscribe_to_stun;
 use crate::subscription_view_response::SubscriptionPeer;
 
 static ALPN: &[u8] = b"h3";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .init().unwrap();
+    let args :Vec<String>= std::env::args().collect();
+    if args.len() < 2 {
+        show_help_message();
+        return Ok(());
+    }
+    let joined = format!("hamash {}",args[1..].join(" "));
+    let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:input|output) \d+:\d+/(?:tcp|udp))*$").unwrap();
+    if !regex.is_match(joined.as_str()){
+        show_help_message();
+        return Ok(());
+    }
     let socket = &std::net::UdpSocket::bind("[::]:0").unwrap();
-    let socket_copy = socket.try_clone().unwrap();
     let mut client_endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
-    client_endpoint.rebind(socket_copy).expect("Could not rebind the QUIC connection to a existing UDP Socket");
+    client_endpoint.rebind(socket.try_clone().unwrap()).expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
-    let subscription_response_str = http3get(&mut client_endpoint, "https://hamash-stun.blackmidori.com/subscription?version=1").await?;
-    let subscription_response = serde_json::from_str::<subscription_response::SubscriptionResponse>(&subscription_response_str).unwrap();
-
+    let subscription_result = subscribe_to_stun(socket).await;
     let input_result = tokio::spawn(read_peer_subscription());
-    let subscription_id = subscription_response.value.subscription_id;
-    print!("My subscription id: {}\n", subscription_id);
+    let subscription_id = subscription_result?;
     static mut ALREADY_CONNECTED: bool = false;
     let mut client_clone = client_endpoint.clone();
     tokio::join!(
          async{
             let result = async {
                   let mut interval = time::interval(Duration::from_secs(1));
-        let mut stdout = io::stdout();
+            interval.tick().await;
         loop {
                     unsafe{
                     if ALREADY_CONNECTED{
                         return Ok::<bool, ()>(false);
                     }
                     }
-            stdout.write(".".as_ref());
-            stdout.flush();
-            let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamash-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await;
+            let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await;
 
             match subscription_view_response_str_result {
                 Ok(subscription_view_response_str) => {
@@ -70,12 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    print!("Error polling subscription: {:?}", e)
+                    error!("error polling subscription: {:?}", e)
                 }
             }
             interval.tick().await;
         }
-        print!("Subscription timeout!\n");
+        info!("subscription expired!");
         return Ok(false);
             }.await;
             match result{
@@ -85,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 Err(..)=>{
-                    print!("Failed waiting peers to connect.")
+                    error!("failed waiting peers to connect.")
                 }
             }
          },
@@ -95,16 +104,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe{
 
     if  ALREADY_CONNECTED {
-        print!("already connected!")
+        warn!("already connected!")
     } else {
                     ALREADY_CONNECTED = true;
-        http3get(&mut client_endpoint, format!("https://hamash-stun.blackmidori.com/join/{subscription_id}?version=1").as_str()).await.unwrap();
-        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamash-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await.unwrap();
+        http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}?version=1").as_str()).await.unwrap();
+        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await.unwrap();
 
         let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
 
         if subscription_response.value.peers.len() < 2 {
-            print!("After we joined, we didn't find 2 peers in this subscription. It may be expired.")
+            error!("after we joined, we didn't find 2 peers in this subscription. It may be expired.")
         } else {
             let peer_a = &subscription_response.value.peers[0];
             let peer_b = &subscription_response.value.peers[1];
@@ -116,6 +125,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+fn show_help_message(){
+    print!("\
+Usage: hamesh p2p <ip_version: ipv4|ipv6> [--input <host_port>:<remote_host_port>/<protocol: tcp|udp>...] [--output <host_port>:<remote_host_port>/<protocol: tcp|udp>...]\n\
+\n\
+Server Example: hamesh p2p ipv6 --input 25565:1234/tcp\n\
+Client Example: hamesh p2p ipv6 --output 1234:25565/tcp\
+")
 }
 
 async fn connect_peers(socket: &std::net::UdpSocket, source_peer: &SubscriptionPeer, dest_peer: &SubscriptionPeer) {
@@ -136,7 +154,7 @@ async fn connect_peers(socket: &std::net::UdpSocket, source_peer: &SubscriptionP
 
 
 async fn read_peer_subscription() -> Result<String, io::Error> {
-    print!("Enter a peer subscription id:\n");
+    info!("enter a peer subscription id:");
     Ok(io::stdin().lines().next().unwrap().unwrap())
 }
 
@@ -158,7 +176,7 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
         .next()
         .ok_or("dns found no addresses")?;
 
-    info!("DNS lookup for {:?}: {:?}", uri, addr);
+    // info!("DNS lookup for {:?}: {:?}", uri, addr);
 
     // create quinn client endpoint
 
@@ -204,7 +222,7 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
 
     let conn = client_endpoint.connect(addr, auth.host())?.await?;
 
-    info!("QUIC connection established");
+    // info!("QUIC connection established");
 
     // create h3 client
 
@@ -227,7 +245,7 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
     //             So we "move" it.
     //                  vvvv
     let request = async move {
-        info!("sending request ...");
+        // info!("sending request ...");
 
         let req = http::Request::builder().uri(uri).body(())?;
 
@@ -238,11 +256,11 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
         // finish on the sending side
         stream.finish().await?;
 
-        info!("receiving response ...");
+        // info!("receiving response ...");
 
-        let resp = stream.recv_response().await?;
+        stream.recv_response().await?;
 
-        info!("response: {:?} {}", resp.version(), resp.status());
+        // info!("response: {:?} {}", resp.version(), resp.status());
         // info!("headers: {:#?}", resp.headers());
 
         let mut buffer = [0; 1024];
