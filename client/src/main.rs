@@ -4,11 +4,12 @@ mod control_datagram;
 mod client;
 mod stun_client;
 mod port_settings;
+mod ip_version;
 
 use std::{io};
 use std::io::{Read};
 use std::sync::Arc;
-use std::net::{ SocketAddr};
+use std::net::{SocketAddr, SocketAddrV6};
 use std::str::FromStr;
 use std::time::Duration;
 use regex::Regex;
@@ -24,6 +25,7 @@ use quinn::Endpoint;
 use simple_logger::SimpleLogger;
 use tokio::time;
 use crate::client::establish_connection;
+use crate::ip_version::IpVersion;
 use crate::stun_client::subscribe_to_stun;
 use crate::subscription_view_response::SubscriptionPeer;
 
@@ -34,14 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new()
         .with_level(LevelFilter::Info)
         .init().unwrap();
-    let args :Vec<String>= std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         show_help_message();
         return Ok(());
     }
-    let joined = format!("hamash {}",args[1..].join(" "));
+    let joined = format!("hamash {}", args[1..].join(" "));
     let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:input|output) \d+:\d+/(?:tcp|udp))*$").unwrap();
-    if !regex.is_match(joined.as_str()){
+    if !regex.is_match(joined.as_str()) {
         show_help_message();
         return Ok(());
     }
@@ -49,8 +51,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Provide at least one --input or --output argument");
         return Ok(());
     }
-    let socket = &std::net::UdpSocket::bind("[::]:0").unwrap();
-    let mut client_endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
+    let ip_version_str = &args[2];
+    let ip_version = match ip_version_str.as_str() {
+        "ipv4" => { IpVersion::Ipv4 }
+        "ipv6" => { IpVersion::Ipv6 }
+        _ => {
+            error!("invalid ip version: {}",ip_version_str);
+            return Ok(());
+        }
+    };
+    let socket = &match ip_version {
+        IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
+        IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
+    }.unwrap();
+    let mut client_endpoint = match ip_version {
+        IpVersion::Ipv4 => { Endpoint::client("0.0.0.0:0".parse().unwrap())? }
+        IpVersion::Ipv6 => { Endpoint::client("[::]:0".parse().unwrap())? }
+    };
     client_endpoint.rebind(socket.try_clone().unwrap()).expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
     let subscription_result = subscribe_to_stun(socket).await;
@@ -132,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn show_help_message(){
+fn show_help_message() {
     print!("\
 Usage: hamesh p2p <ip_version: ipv4|ipv6> [--input <host_port>:<remote_host_port>/<protocol: tcp|udp>...] [--output <host_port>:<remote_host_port>/<protocol: tcp|udp>...]\n\
 \n\
@@ -176,10 +193,42 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
 
     let port = auth.port_u16().unwrap_or(443);
 
-    let addr = tokio::net::lookup_host((auth.host(), port))
-        .await?
-        .next()
-        .ok_or("dns found no addresses")?;
+    let args: Vec<String> = std::env::args().collect();
+    let ip_version_str = &args[2];
+    let ip_version = match ip_version_str.as_str() {
+        "ipv4" => { IpVersion::Ipv4 }
+        "ipv6" => { IpVersion::Ipv6 }
+        _ => {
+            error!("invalid ip version: {}",ip_version_str);
+            IpVersion::Ipv6
+        }
+    };
+    let addresses =tokio::net::lookup_host((auth.host(), port))
+        .await?;
+    let mut address_option = None;
+    for socket_address in addresses {
+        match socket_address {
+            SocketAddr::V4(_)=>{
+                match ip_version{
+                    IpVersion::Ipv4 => {
+                        address_option = Some(socket_address);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            SocketAddr::V6(_)=>{
+                match ip_version{
+                    IpVersion::Ipv6 => {
+                        address_option = Some(socket_address);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let address = address_option.ok_or("dns found no addresses")?;
 
     // info!("DNS lookup for {:?}: {:?}", uri, addr);
 
@@ -214,7 +263,7 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
     let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
     client_endpoint.set_default_client_config(client_config);
 
-    let body = run_client(&client_endpoint, addr, uri).await;
+    let body = run_client(&client_endpoint, address, uri).await;
 
     // wait for the connection to be closed before exiting
     client_endpoint.wait_idle().await;

@@ -1,18 +1,17 @@
 use std::collections::HashMap;
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, SendError, TryRecvError};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
-use futures::future::err;
 use log::{error, info, warn};
 use regex::Regex;
-use tokio::net::UdpSocket;
 use tokio::time;
 use crate::port_settings::{PortSettings, Protocol};
 use crate::control_datagram::ControlDatagram;
+use crate::ip_version::IpVersion;
 
 pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: SocketAddr, dest_peer: SocketAddr) {
-    let socket = UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap();
+    let socket = tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap();
     socket.connect(dest_peer).await.expect("Failed to connect to remote UDP");
     info!(
         "connected {} <-> {}", source_peer.to_string(), dest_peer.to_string());
@@ -35,7 +34,7 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
         let remote_host_port = ports[1].parse().unwrap();
         let protocol = match protocol_str {
             "tcp" => Protocol::Tcp,
-            "udp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
             _ => continue
         };
         match input_or_output {
@@ -78,7 +77,7 @@ async fn delivery_syn(socket_std: std::net::UdpSocket, received_syn_ack: &Atomic
     let mut interval = time::interval(Duration::from_secs(1));
     loop {
         if !received_syn_ack.load(Ordering::Relaxed) {
-            send_syn(UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap()).await;
+            send_syn(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap()).await;
             interval.tick().await;
         } else {
             break;
@@ -92,20 +91,20 @@ async fn delivery_input_ports(socket_std: std::net::UdpSocket, input_settings: &
     remaining_inputs.extend(input_settings.into_iter());
     loop {
         if !remaining_inputs.is_empty() {
-            for (key,value) in &remaining_inputs {
+            for (key, value) in &remaining_inputs {
                 let id = format!("input_port_{}", key);
-                send_input_port(UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), id.as_str(), value).await;
+                send_input_port(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), id.as_str(), value).await;
             }
             interval.tick().await;
 
-            match inputs_ack_rx.try_recv(){
-                Ok(id)=>{
-                    let maybe_item = remaining_inputs.iter().find(|(key,value)|{
+            match inputs_ack_rx.try_recv() {
+                Ok(id) => {
+                    let maybe_item = remaining_inputs.iter().find(|(key, value)| {
                         let local_id = format!("input_port_{}", key);
                         local_id == id
                     });
                     match maybe_item {
-                        Some((key,entry)) => {
+                        Some((key, entry)) => {
                             remaining_inputs.remove(*key);
                         }
                         _ => {}
@@ -119,7 +118,18 @@ async fn delivery_input_ports(socket_std: std::net::UdpSocket, input_settings: &
     }
 }
 
+
 async fn datagram_handler(socket_std: std::net::UdpSocket, output_settings: HashMap<String, PortSettings>, receiver: Receiver<ControlDatagram>) {
+    let args: Vec<String> = std::env::args().collect();
+    let ip_version_str = &args[2];
+    let ip_version = match ip_version_str.as_str() {
+        "ipv4" => { IpVersion::Ipv4 }
+        "ipv6" => { IpVersion::Ipv6 }
+        _ => {
+            error!("invalid ip version: {}",ip_version_str);
+            return;
+        }
+    };
     let mut output_tcp_sockets = HashMap::new();
     let mut output_udp_sockets = HashMap::new();
     loop {
@@ -134,7 +144,7 @@ async fn datagram_handler(socket_std: std::net::UdpSocket, output_settings: Hash
                         let input_settings = PortSettings {
                             protocol: match protocol_str {
                                 "tcp" => Protocol::Tcp,
-                                "udp" => Protocol::Tcp,
+                                "udp" => Protocol::Udp,
                                 _ => {
                                     error!("invalid protocol {}", protocol_str);
                                     continue;
@@ -151,20 +161,31 @@ async fn datagram_handler(socket_std: std::net::UdpSocket, output_settings: Hash
                                 match output_settings.protocol {
                                     Protocol::Tcp => {
                                         let port = output_settings.host_port;
-                                        if output_tcp_sockets.contains_key(&port){
+                                        if output_tcp_sockets.contains_key(&port) {
                                             warn!("already open {port}/tcp");
+                                            continue;
                                         }
-                                        let address = format!("[::]:{port}").parse().unwrap();
-                                        let tcp_socket = tokio::net::TcpSocket::new_v6();
-                                        match tcp_socket {
-                                            Ok(socket) => {
-                                                let result = socket.bind(address);
+                                        let address;
+                                        let tcp_socket_result;
+                                        match ip_version {
+                                            IpVersion::Ipv4 => {
+                                                address = format!("0.0.0.0:{port}").parse().unwrap();
+                                                tcp_socket_result = tokio::net::TcpSocket::new_v4();
+                                            }
+                                            IpVersion::Ipv6 => {
+                                                address = format!("[::]:{port}").parse().unwrap();
+                                                tcp_socket_result = tokio::net::TcpSocket::new_v6();
+                                            }
+                                        }
+                                        match tcp_socket_result {
+                                            Ok(tcp_socket) => {
+                                                let result = tcp_socket.bind(address);
                                                 match result {
                                                     Ok(_) => {
-                                                        output_tcp_sockets.insert(port,socket);
+                                                        output_tcp_sockets.insert(port, tcp_socket);
                                                         info!("listening on {address}/tcp")
                                                     }
-                                                    Err(error)=>{
+                                                    Err(error) => {
                                                         error!("could not start a tcp socket: {}",error)
                                                     }
                                                 }
@@ -174,17 +195,28 @@ async fn datagram_handler(socket_std: std::net::UdpSocket, output_settings: Hash
                                     }
                                     Protocol::Udp => {
                                         let port = output_settings.host_port;
-                                        if output_udp_sockets.contains_key(&port){
+                                        if output_udp_sockets.contains_key(&port) {
                                             warn!("already open {port}/udp");
+                                            continue;
                                         }
-                                        let address: SocketAddrV6 = format!("[::]:{port}").parse().unwrap();
-                                        let udp_socket = tokio::net::UdpSocket::bind(address).await;
-                                        match udp_socket {
-                                            Ok(socket) => {
-                                                output_udp_sockets.insert(port,socket);
+                                        let address: SocketAddr;
+                                        let udp_socket_result;
+                                        match ip_version {
+                                            IpVersion::Ipv4 => {
+                                                address = SocketAddr::V4(format!("0.0.0.0:{port}").parse::<SocketAddrV4>().unwrap());
+                                                udp_socket_result = tokio::net::UdpSocket::bind(address).await;
+                                            }
+                                            IpVersion::Ipv6 => {
+                                                address = SocketAddr::V6(format!("[::]:{port}").parse::<SocketAddrV6>().unwrap());
+                                                udp_socket_result = tokio::net::UdpSocket::bind(address).await;
+                                            }
+                                        }
+                                        match udp_socket_result {
+                                            Ok(udp_socket) => {
+                                                output_udp_sockets.insert(port, udp_socket);
                                                 info!("listening on {address}/udp")
                                             }
-                                            Err(error)=>{
+                                            Err(error) => {
                                                 error!("could not start a udp socket: {}",error)
                                             }
                                         }
@@ -210,11 +242,11 @@ async fn datagram_handler(socket_std: std::net::UdpSocket, output_settings: Hash
 
 async fn socket_read_loop_wrapper(socket_std: std::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_sender: &Sender<String>, sender: &Sender<ControlDatagram>) {
     loop {
-        socket_read_loop(UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), received_syn_ack, inputs_sender, sender).await
+        socket_read_loop(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), received_syn_ack, inputs_sender, sender).await
     }
 }
 
-async fn socket_read_loop(socket: UdpSocket, received_syn_ack: &AtomicBool, inputs_sender:&Sender<String>,  sender: &Sender<ControlDatagram>) {
+async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_sender: &Sender<String>, sender: &Sender<ControlDatagram>) {
     let mut buff = [0; 4096];
     match socket.recv(&mut buff).await {
         Ok(size) => {
@@ -259,7 +291,7 @@ async fn socket_read_loop(socket: UdpSocket, received_syn_ack: &AtomicBool, inpu
                                         }
                                     }
                                     let r#type = control_datagram.r#type.as_str().to_string();
-                                    let id_option_str =id_option.and_then(|text|Some(text.to_string()));
+                                    let id_option_str = id_option.and_then(|text| Some(text.to_string()));
                                     match sender.send(control_datagram) {
                                         Ok(_) => {}
                                         Err(_) => {
@@ -292,25 +324,25 @@ async fn socket_read_loop(socket: UdpSocket, received_syn_ack: &AtomicBool, inpu
     };
 }
 
-async fn send_syn(socket: UdpSocket) {
+async fn send_syn(socket: tokio::net::UdpSocket) {
     let datagram = ControlDatagram::syn();
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
     socket.send(datagram_bytes.as_slice()).await.expect("Failed to send SYN");
     info!(" ⃤ SENT SYN");
 }
 
-async fn send_ack(socket: UdpSocket, id: &str) {
+async fn send_ack(socket: tokio::net::UdpSocket, id: &str) {
     let datagram = ControlDatagram::ack(id);
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
     socket.send(datagram_bytes.as_slice()).await.expect(format!("Failed to send {}", datagram.r#type).as_str());
     info!(" ⃤ SENT ACK{{id:{}}}", id);
 }
 
-async fn send_input_port(socket: UdpSocket, id: &str, port_settings: &PortSettings) {
-    let datagram = ControlDatagram::input_port(id, PortSettings{
-        protocol: match port_settings.protocol{
-            Protocol::Tcp => {Protocol::Tcp}
-            Protocol::Udp => {Protocol::Udp}
+async fn send_input_port(socket: tokio::net::UdpSocket, id: &str, port_settings: &PortSettings) {
+    let datagram = ControlDatagram::input_port(id, PortSettings {
+        protocol: match port_settings.protocol {
+            Protocol::Tcp => { Protocol::Tcp }
+            Protocol::Udp => { Protocol::Udp }
         },
         host_port: port_settings.host_port,
         remote_host_port: port_settings.remote_host_port,
