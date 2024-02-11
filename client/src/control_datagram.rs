@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use crate::port_settings::{PortSettings, Protocol};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize,Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlDatagram {
     pub version: i32,

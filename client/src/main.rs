@@ -1,10 +1,11 @@
 mod subscription_response;
 mod subscription_view_response;
 mod control_datagram;
-mod client;
+mod tunnel;
 mod stun_client;
 mod port_settings;
 mod ip_version;
+mod output_server;
 
 use std::{io};
 use std::io::{Read};
@@ -24,7 +25,7 @@ use http::Uri;
 use quinn::Endpoint;
 use simple_logger::SimpleLogger;
 use tokio::time;
-use crate::client::establish_connection;
+use crate::tunnel::establish_connection;
 use crate::ip_version::IpVersion;
 use crate::stun_client::subscribe_to_stun;
 use crate::subscription_view_response::SubscriptionPeer;
