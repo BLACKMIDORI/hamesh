@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::broadcast::{channel, Receiver, Sender};
+use tokio::sync::broadcast::{channel, Sender};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use base64::DecodeError;
-use futures::{FutureExt, SinkExt};
+use futures::{SinkExt};
 use log::{error, info, warn};
 use regex::Regex;
+use serde_json::de::Read;
 use tokio::sync::broadcast::error::{RecvError, SendError};
 use tokio::time;
 use tokio::time::Instant;
@@ -287,8 +288,95 @@ async fn datagram_handler(reader_sender: Sender<ControlDatagram>, writer_sender:
     }
 }
 
+#[derive(Clone)]
+struct InputClientData {
+    input_settings: PortSettings,
+    datagram: ControlDatagram,
+}
+
 async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mut remote_client_data_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>, input_settings: HashMap<String, PortSettings>) {
-    let mut clients = HashMap::new();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<InputClientData>(1024);
+
+    tokio::spawn(async move {
+        // TODO: improve clients handling, one thread to insert, another to remove(when client is closed).
+        let mut clients = HashMap::new();
+        // let mut to_remove = Vec::new();
+        let mut interval = time::interval(Duration::from_secs(10));
+        let should_perform_clients_scan = AtomicBool::new(false);
+        tokio::join!(async {
+            loop{
+                interval.tick().await;
+                should_perform_clients_scan.store(true, Ordering::Relaxed);
+            }
+        },
+        async{
+                loop{
+                    match receiver.recv().await {
+                        Some(data)=>{
+                    let input_settings = data.input_settings;
+                    let datagram = data.datagram;
+                    let content = &datagram.content;
+                    let protocol_str = datagram.content["protocol"].as_str();
+                    let host_port_str = datagram.content["hostPort"].as_str();
+                    let host_client_port_str = content["hostClientPort"].as_str();
+                    let client_data_settings = ClientDataSettings {
+                        protocol: match protocol_str {
+                            "tcp" => Protocol::Tcp,
+                            "udp" => Protocol::Udp,
+                            _ => {
+                                error!("invalid protocol {}", protocol_str);
+                                continue;
+                            }
+                        },
+                        host_port: host_port_str.parse().unwrap(),
+                        host_client_port: host_client_port_str.parse().unwrap(),
+                    };
+                    let data_base64 = datagram.content["base64"].as_str();
+                    let data_result = base64::decode(data_base64);
+                    match data_result{
+                        Ok(data) => {
+                            let client_id = format!("{}_{}_{}", protocol_str, client_data_settings.host_port, client_data_settings.host_client_port);
+                            let mut client_option = clients.get(client_id.as_str()).cloned();
+                            if client_option.is_none(){
+                                let (to_inside,_) = channel(1024);
+                                let client = InputClient::new(client_data_settings,to_inside);
+                                clients.insert(client_id.clone(), client.clone());
+                                info!("client inserted: {}",client_id.as_str());
+                                client_option = Some(client.clone());
+                                client.start(input_settings,tunnel_writer_sender.clone()).await;
+                            }
+                            let client = client_option.unwrap();
+                            match client.from_outside_tx.send(data){
+                                Ok(_) => {}
+                                Err(error) => {
+                                    error!("could not send the received data to local server: {error}")
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            error!("could not decode remote client data: {error}")
+                        }
+                    }
+                }
+                None => {
+                    error!("could not receive data from input clients channel: None");
+                }
+            }
+                     if should_perform_clients_scan.load(Ordering::Relaxed){
+                        let mut  count = 0;
+                        for (key,client) in clients.clone(){
+                            if *client.is_closed.lock().await {
+                            clients.remove(key.as_str());
+                                count = count+1;
+                            }
+                        }
+                        if count>0{
+                    info!("clients removed: {count}");
+                        }
+                    }
+        }
+            });
+    });
     loop {
         match remote_client_data_receiver.recv().await {
             Some(datagram) => {
@@ -314,31 +402,15 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                             settings.protocol == client_data_settings.protocol && settings.remote_host_port == client_data_settings.host_port
                         });
 
-                        match input_settings_option{
-                            Some((key, input_settings))=>{
-                                let data_base64 = datagram.content["base64"].as_str();
-                                let data_result = base64::decode(data_base64);
-                                match data_result{
-                                    Ok(data) => {
-                                        let client_id = format!("{}_{}_{}", protocol_str, client_data_settings.host_port, client_data_settings.host_client_port);
-                                        let mut client_option = clients.get(&client_id).cloned();
-                                        if client_option.is_none(){
-                                            let (to_inside,_) = channel(1024);
-                                            let client = InputClient::new(client_data_settings,to_inside);
-                                            clients.insert(client_id, client.clone());
-                                            client_option = Some(client.clone());
-                                            client.start(input_settings, tunnel_writer_sender.clone()).await;
-                                        }
-                                        let client = client_option.unwrap();
-                                        match client.from_outside_tx.send(data){
-                                            Ok(_) => {}
-                                            Err(error) => {
-                                                error!("could not send the received data to local server: {error}")
-                                            }
-                                        }
-                                    }
+                        match input_settings_option {
+                            Some((key, input_settings)) => {
+                                match sender.send(InputClientData {
+                                    input_settings: input_settings.clone(),
+                                    datagram,
+                                }).await {
+                                    Ok(_) => {}
                                     Err(error) => {
-                                        error!("could not decode remote client data: {error}")
+                                        error!("could not send data to input clients channel: {error}");
                                     }
                                 }
                             }

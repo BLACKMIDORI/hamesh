@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::str::Utf8Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel};
 use base64::DecodeError;
 use log::{error, info};
@@ -101,52 +102,8 @@ impl OutputServer {
                                 Ok((mut tcp_stream, local_client_address)) => {
                                     let (mut read_stream, mut write_stream) = tcp_stream.into_split();
                                     let host_client_port = local_client_address.port();
-                                    tokio::spawn(async move {
-                                        loop {
-                                            match receiver.recv().await {
-                                                Ok(datagram) => {
-                                                    let protocol_str = datagram.content["protocol"].as_str();
-                                                    let remote_host_port_str = datagram.content["remoteHostPort"].as_str();
-                                                    let remote_host_client_port_str = datagram.content["remoteHostClientPort"].as_str();
-                                                    let server_data_settings = ServerDataSettings {
-                                                        protocol: match protocol_str {
-                                                            "tcp" => Protocol::Tcp,
-                                                            "udp" => Protocol::Udp,
-                                                            _ => {
-                                                                error!("invalid protocol {}", protocol_str);
-                                                                continue;
-                                                            }
-                                                        },
-                                                        remote_host_port: remote_host_port_str.parse().unwrap(),
-                                                        remote_host_client_port: remote_host_client_port_str.parse().unwrap(),
-                                                    };
-                                                    if server_data_settings.remote_host_port == host_port && server_data_settings.remote_host_client_port == host_client_port{
-                                                        let data_base64 = datagram.content["base64"].as_str();
-                                                        let data_result = base64::decode(data_base64);
-                                                        match data_result{
-                                                            Ok(data) => {
-
-                                                                match  write_stream.write(data.as_slice()).await{
-                                                                    Ok(_) => {}
-                                                                    Err(error) => {
-                                                                        error!("could not send the received data to local client: {error}")
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(error) => {
-                                                                error!("could not decode remote server data: {error}")
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                Err(error) => {
-                                                    error!("could not received data on the local client: {}",error)
-                                                }
-                                            }
-                                        }
-                                    });
                                     let tunnel_sender = tunnel_sender_to_clone.clone();
-                                    tokio::spawn(async move {
+                                    let reader_handler = tokio::spawn(async move {
                                         let mut count: u64 = 0;
                                         let mut received_zero_bytes = false;
                                         loop {
@@ -159,7 +116,6 @@ impl OutputServer {
                                                             received_zero_bytes = true;
                                                             continue;
                                                         }else{
-                                                            info!("closed {}/tcp",local_client_address );
                                                             break;
                                                         }
                                                     }
@@ -182,11 +138,77 @@ impl OutputServer {
                                                     }
                                                 }
                                                 Err(error) => {
-                                                    error!("could not read local client data: {}", error)
+                                                    error!("could not read local client data: {}", error);
+                                                    break;
                                                 }
                                             };
                                             count += 1;
                                         }
+                                    });
+                                    let support_sender = broadcast_sender.clone();
+                                    tokio::spawn(async move{
+                                        let _ = reader_handler.await;
+                                        // Gracefully free the write thread and close it
+                                        support_sender.send(ControlDatagram::server_data(
+                                            "close",
+                                            ServerDataSettings{
+                                                protocol: Protocol::Tcp,
+                                                remote_host_port: host_port,
+                                                remote_host_client_port: host_client_port
+                                            },
+                                            ""
+                                        )).expect("failed to signal the writer to close");
+                                    });
+                                    tokio::spawn(async move {
+                                        loop {
+                                            match receiver.recv().await {
+                                                Ok(datagram) => {
+                                                    let protocol_str = datagram.content["protocol"].as_str();
+                                                    let remote_host_port_str = datagram.content["remoteHostPort"].as_str();
+                                                    let remote_host_client_port_str = datagram.content["remoteHostClientPort"].as_str();
+                                                    let server_data_settings = ServerDataSettings {
+                                                        protocol: match protocol_str {
+                                                            "tcp" => Protocol::Tcp,
+                                                            "udp" => Protocol::Udp,
+                                                            _ => {
+                                                                error!("invalid protocol {}", protocol_str);
+                                                                continue;
+                                                            }
+                                                        },
+                                                        remote_host_port: remote_host_port_str.parse().unwrap(),
+                                                        remote_host_client_port: remote_host_client_port_str.parse().unwrap(),
+                                                    };
+                                                    if server_data_settings.protocol == Protocol::Tcp && server_data_settings.remote_host_port == host_port && server_data_settings.remote_host_client_port == host_client_port{
+                                                        let data_base64 = datagram.content["base64"].as_str();
+                                                        let data_result = base64::decode(data_base64);
+                                                        match data_result{
+                                                            Ok(data) => {
+                                                                if data.is_empty(){
+                                                                    let id = datagram.content["id"].as_str();
+                                                                    if id == "close"{
+                                                                        break;
+                                                                    }
+                                                                }
+
+                                                                match  write_stream.write(data.as_slice()).await{
+                                                                    Ok(_) => {}
+                                                                    Err(error) => {
+                                                                        error!("could not send the received data to local client: {error}")
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(error) => {
+                                                                error!("could not decode remote server data: {error}")
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    error!("could not received data on the local client: {}",error)
+                                                }
+                                            }
+                                        }
+                                        info!("closed {}/tcp",local_client_address );
                                     });
                                 }
                                 Err(error) => {
