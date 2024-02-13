@@ -3,7 +3,7 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use log::{error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::Mutex;
 use crate::control_datagram::ControlDatagram;
@@ -37,83 +37,130 @@ impl InputClient {
             }
         }
 
-        match TcpStream::connect(address).await {
-            Ok(stream) => {
-                let client_address = stream.local_addr().unwrap();
-                let client_port = client_address.port();
-                let (mut read_stream, mut write_stream) = stream.into_split();
-                let mut receiver = self.from_outside_tx.subscribe();
-                let reader_handler = tokio::spawn(async move {
-                    let mut count: u64 = 0;
-                    let mut received_zero_bytes = false;
-                    loop {
-                        let id = format!("tcp_server_{server_port}_{client_port}_{count}");
-                        let mut buff = [0; 10240];
-                        match read_stream.read(&mut buff).await {
-                            Ok(size) => {
-                                if size == 0 {
-                                    if !received_zero_bytes {
-                                        received_zero_bytes = true;
-                                        continue;
-                                    } else {
+        match self.settings.protocol{
+            Protocol::Tcp => {
+                match TcpStream::connect(address).await {
+                    Ok(stream) => {
+                        let client_address = stream.local_addr().unwrap();
+                        let client_port = client_address.port();
+                        let (mut read_stream, mut write_stream) = stream.into_split();
+                        let mut receiver = self.from_outside_tx.subscribe();
+                        let reader_handler = tokio::spawn(async move {
+                            let mut count: u64 = 0;
+                            let mut received_zero_bytes = false;
+                            loop {
+                                let id = format!("tcp_server_{server_port}_{client_port}_{count}");
+                                let mut buff = [0; 10240];
+                                match read_stream.read(&mut buff).await {
+                                    Ok(size) => {
+                                        if size == 0 {
+                                            if !received_zero_bytes {
+                                                received_zero_bytes = true;
+                                                continue;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                        received_zero_bytes = false;
+                                        let encoded_data = base64::encode(&buff[..size]);
+                                        let datagram = ControlDatagram::server_data(
+                                            id.as_str(),
+                                            ServerDataSettings {
+                                                protocol: Protocol::Tcp,
+                                                remote_host_port: self.settings.host_port,
+                                                remote_host_client_port: self.settings.host_client_port,
+                                            },
+                                            encoded_data.as_str(),
+                                        );
+                                        match tunnel_sender.send(datagram.clone()) {
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                error!("could not send local client data: {}", error);
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("could not read local server data({address}): {}", error);
                                         break;
                                     }
                                 }
-                                received_zero_bytes = false;
-                                let encoded_data = base64::encode(&buff[..size]);
-                                let datagram = ControlDatagram::server_data(
-                                    id.as_str(),
-                                    ServerDataSettings {
-                                        protocol: Protocol::Tcp,
-                                        remote_host_port: self.settings.host_port,
-                                        remote_host_client_port: self.settings.host_client_port,
-                                    },
-                                    encoded_data.as_str(),
-                                );
-                                match tunnel_sender.send(datagram.clone()) {
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        error!("could not send local client data: {}", error);
+                            }
+                        });
+                        let support_sender = self.from_outside_tx.clone();
+                        tokio::spawn(async move{
+                            let _ = reader_handler.await;
+                            // Gracefully free the write thread and close it
+                            support_sender.send(Vec::new()).expect("failed to signal the writer to close");
+                        });
+                        let writer_handler = tokio::spawn(async  move{
+                            loop {
+                                match receiver.recv().await {
+                                    Ok(data) => {
+                                        if data.is_empty() {
+                                            break;
+                                        }
+                                        match write_stream.write(&data).await {
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                error!("could not receive the data for local server on its client: {error}")
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            info!("closed {}/tcp",client_address );
+                            let mut is_close_mutex = self.is_closed.lock().await;
+                            *is_close_mutex = true;
+                        });
+                    }
+                    Err(error) => {
+                        error!("Failed to connect to local server({address}): {error}");
+                    }
+                }
+            }
+            Protocol::Udp => {
+                // TODO: implement UDP
+                let client_address;
+                match get_ip_version().unwrap() {
+                    IpVersion::Ipv4 => {
+                        client_address = SocketAddr::V4("0.0.0.0:0".parse::<SocketAddrV4>().unwrap());
+                        // tcp_listener_result = tokio::net::TcpListener::bind(address).await;
+                    }
+                    IpVersion::Ipv6 => {
+                        client_address = SocketAddr::V6("[::]:0".parse::<SocketAddrV6>().unwrap());
+                        // tcp_listener_result = tokio::net::TcpListener::bind(address).await;
+                    }
+                }
+                let client_socket_result = UdpSocket::bind(client_address).await;
+                match client_socket_result {
+                    Ok(client_socket) => {
+                        match client_socket.connect(address).await{
+                            Ok(_) => {
+                                let client_address = client_socket.local_addr().unwrap();
+                                let client_port = client_address.port();
+                                let mut buffer = [0; 10240];
+                                loop {
+                                    match client_socket.recv_from(&mut buffer).await {
+                                        Ok((size, local_client_address)) => {
+                                            info!("UDP parser not implemented yet, size = {}",size)
+                                        }
+                                        Err(error) => {
+                                            error!("could not read local server data({address}): {}", error);
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             Err(error) => {
-                                error!("could not read local server data({address}): {}", error);
-                                break;
+                                error!("Failed to connect to local server({address}): {error}");
                             }
                         }
                     }
-                });
-                let support_sender = self.from_outside_tx.clone();
-                tokio::spawn(async move{
-                    let _ = reader_handler.await;
-                    // Gracefully free the write thread and close it
-                    support_sender.send(Vec::new()).expect("failed to signal the writer to close");
-                });
-                let writer_handler = tokio::spawn(async  move{
-                    loop {
-                        match receiver.recv().await {
-                            Ok(data) => {
-                                if data.is_empty() {
-                                    break;
-                                }
-                                match write_stream.write(&data).await {
-                                    Ok(_) => {}
-                                    Err(error) => {
-                                        error!("could not receive the data for local server on its client: {error}")
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
+                    Err(error) => {
+                        error!("could not start a udp client socket: {}",error)
                     }
-                    info!("closed {}/tcp",client_address );
-                    let mut is_close_mutex = self.is_closed.lock().await;
-                    *is_close_mutex = true;
-                });
-            }
-            Err(error) => {
-                error!("Failed to connect to local server({address}): {error}");
+                }
             }
         }
     }

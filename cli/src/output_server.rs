@@ -223,6 +223,7 @@ impl OutputServer {
                 }
             }
             OutputServer::Udp(server) => {
+                // TODO: implement UDP
                 let server_socket_result = UdpSocket::bind(server.address).await;
                 match server_socket_result {
                     Ok(server_socket) => {
@@ -232,7 +233,7 @@ impl OutputServer {
                         loop {
                             match server_socket.recv_from(&mut buffer).await {
                                 Ok((size, local_client_address)) => {
-                                    info!("parser not implemented yet, size = {}",size)
+                                    info!("UDP parser not implemented yet, size = {}",size)
                                 }
                                 Err(error) => {
                                     error!("could not read local client data: {}", error)
