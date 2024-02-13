@@ -98,7 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else if subscription_response.value.peers.len() == 2 {
                         let peer_a = &subscription_response.value.peers[0];
                         let peer_b = &subscription_response.value.peers[1];
-                                tokio::join!(connect_peers(socket,peer_a.clone(), peer_b.clone()));
+                        already_connected.store(true, Ordering::Relaxed);
+                        tokio::join!(connect_peers(socket,peer_a.clone(), peer_b.clone()));
                         return Ok(true);
                     }
                 }
@@ -112,11 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(false);
             }.await;
             match result{
-                Ok(connected)=>{
-                    if connected{
-                        already_connected.store(true, Ordering::Relaxed);
-                    }
-                },
+                Ok(_)=>{ },
                 Err(..)=>{
                     error!("failed waiting peers to connect.")
                 }
