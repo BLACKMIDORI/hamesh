@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return Ok::<bool, ()>(false);
                     }
                     }
-            let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await;
+            let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await;
 
             match subscription_view_response_str_result {
                 Ok(subscription_view_response_str) => {
@@ -130,8 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("already connected!")
     } else {
                     ALREADY_CONNECTED = true;
-        http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}?version=1").as_str()).await.unwrap();
-        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}?version=1").as_str()).await.unwrap();
+        http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}").as_str()).await.unwrap();
+        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await.unwrap();
 
         let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
 
@@ -302,7 +302,7 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
     let request = async move {
         // info!("sending request ...");
 
-        let req = http::Request::builder().uri(uri).body(())?;
+        let req = http::Request::builder().uri(uri).header("Accept-Version","1").body(())?;
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
@@ -313,9 +313,8 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
 
         // info!("receiving response ...");
 
-        stream.recv_response().await?;
+        let response = stream.recv_response().await?;
 
-        // info!("response: {:?} {}", resp.version(), resp.status());
         // info!("headers: {:#?}", resp.headers());
 
         let mut buffer = [0; 1024];
@@ -333,6 +332,14 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
         }
 
         let body = std::str::from_utf8(&buffer[..buffer_size]).unwrap().to_string();
+
+
+        let status = response.status();
+        if !status.is_success() {
+            warn!("response: {:?} {}", response.version(), response.status());
+            warn!("body: {}", body);
+        }
+
         Ok::<_, Box<dyn std::error::Error>>(body)
     };
 

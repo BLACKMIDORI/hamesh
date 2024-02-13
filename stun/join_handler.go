@@ -11,11 +11,11 @@ import (
 
 func joinHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Handling: %v\n", r.URL)
-	version := r.URL.Query().Get("version")
+	version := r.Header.Get("Accept-Version")
 	if version == "" {
 		w.WriteHeader(400)
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{"message": "query param 'version' cannot be empty."},
+			"error": map[string]any{"message": "header 'Accept-Version' cannot be empty."},
 		})
 		return
 	}
