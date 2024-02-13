@@ -14,6 +14,7 @@ use std::io::{Read};
 use std::sync::Arc;
 use std::net::{SocketAddr, SocketAddrV6};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use regex::Regex;
 use bytes::Buf;
@@ -76,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscription_result = subscribe_to_stun(socket).await;
     let input_result = tokio::spawn(read_peer_subscription());
     let subscription_id = subscription_result?;
-    static mut ALREADY_CONNECTED: bool = false;
+    let already_connected = std::sync::atomic::AtomicBool::new(false);
     let mut client_clone = client_endpoint.clone();
     tokio::join!(
          async{
@@ -84,10 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                   let mut interval = time::interval(Duration::from_secs(1));
             interval.tick().await;
         loop {
-                    unsafe{
-                    if ALREADY_CONNECTED{
+                    if already_connected.load(Ordering::Relaxed){
                         return Ok::<bool, ()>(false);
-                    }
                     }
             let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await;
 
@@ -113,9 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(false);
             }.await;
             match result{
-                Ok(connected)=>unsafe{
+                Ok(connected)=>{
                     if connected{
-                        ALREADY_CONNECTED = true
+                        already_connected.store(true, Ordering::Relaxed);
                     }
                 },
                 Err(..)=>{
@@ -124,27 +123,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
          },
         async{
+            let subscription_id = input_result.await.unwrap().unwrap();
 
-    let subscription_id = input_result.await.unwrap().unwrap();
-            unsafe{
+            if  already_connected.load(Ordering::Relaxed) {
+                warn!("already connected!")
+            } else {
+                already_connected.store(true, Ordering::Relaxed);
+                http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}").as_str()).await.unwrap();
+                let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await.unwrap();
 
-    if  ALREADY_CONNECTED {
-        warn!("already connected!")
-    } else {
-                    ALREADY_CONNECTED = true;
-        http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}").as_str()).await.unwrap();
-        let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await.unwrap();
+                let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
 
-        let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
-
-        if subscription_response.value.peers.len() < 2 {
-            error!("after we joined, we didn't find 2 peers in this subscription. It may be expired.")
-        } else {
-            let peer_a = &subscription_response.value.peers[0];
-            let peer_b = &subscription_response.value.peers[1];
-            tokio::join!(connect_peers(socket, peer_b,peer_a));
-        }
-    }
+                if subscription_response.value.peers.len() < 2 {
+                    error!("after we joined, we didn't find 2 peers in this subscription. It may be expired.")
+                } else {
+                    let peer_a = &subscription_response.value.peers[0];
+                    let peer_b = &subscription_response.value.peers[1];
+                    tokio::join!(connect_peers(socket, peer_b,peer_a));
+                }
             }
         }
     );
@@ -206,13 +202,13 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
             IpVersion::Ipv6
         }
     };
-    let addresses =tokio::net::lookup_host((auth.host(), port))
+    let addresses = tokio::net::lookup_host((auth.host(), port))
         .await?;
     let mut address_option = None;
     for socket_address in addresses {
         match socket_address {
-            SocketAddr::V4(_)=>{
-                match ip_version{
+            SocketAddr::V4(_) => {
+                match ip_version {
                     IpVersion::Ipv4 => {
                         address_option = Some(socket_address);
                         break;
@@ -220,8 +216,8 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
                     _ => {}
                 }
             }
-            SocketAddr::V6(_)=>{
-                match ip_version{
+            SocketAddr::V6(_) => {
+                match ip_version {
                     IpVersion::Ipv6 => {
                         address_option = Some(socket_address);
                         break;
@@ -304,7 +300,7 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
     let request = async move {
         // info!("sending request ...");
 
-        let req = http::Request::builder().uri(uri).header("Accept-Version","1").body(())?;
+        let req = http::Request::builder().uri(uri).header("Accept-Version", "1").body(())?;
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
