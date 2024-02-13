@@ -3,9 +3,11 @@ mod subscription_view_response;
 mod control_datagram;
 mod tunnel;
 mod stun_client;
-mod port_settings;
+mod settings_models;
 mod ip_version;
 mod output_server;
+mod input_client;
+mod get_ip_version;
 
 use std::{io};
 use std::io::{Read};

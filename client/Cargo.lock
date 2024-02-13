@@ -321,6 +321,7 @@ name = "hamesh_cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.13.1",
  "bytes",
  "futures",
  "h3",
