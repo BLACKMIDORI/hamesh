@@ -46,10 +46,10 @@ impl InputClient {
                         let (mut read_stream, mut write_stream) = stream.into_split();
                         let mut receiver = self.from_outside_tx.subscribe();
                         let reader_handler = tokio::spawn(async move {
-                            let mut count: u64 = 0;
+                            let mut sequence: u64 = 0;
                             let mut received_zero_bytes = false;
                             loop {
-                                let id = format!("tcp_server_{server_port}_{client_port}_{count}");
+                                let id = format!("tcp_server_{server_port}_{client_port}_{sequence}");
                                 let mut buff = [0; 10240];
                                 match read_stream.read(&mut buff).await {
                                     Ok(size) => {
@@ -65,6 +65,7 @@ impl InputClient {
                                         let encoded_data = base64::encode(&buff[..size]);
                                         let datagram = ControlDatagram::server_data(
                                             id.as_str(),
+                                            sequence,
                                             ServerDataSettings {
                                                 protocol: Protocol::Tcp,
                                                 remote_host_port: self.settings.host_port,
@@ -78,6 +79,7 @@ impl InputClient {
                                                 error!("could not send local client data: {}", error);
                                             }
                                         }
+                                        sequence += 1;
                                     }
                                     Err(error) => {
                                         error!("could not read local server data({address}): {}", error);

@@ -51,7 +51,7 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
 
     let args: Vec<String> = std::env::args().collect();
     let joined = args[1..].join(" ");
-    let regex = Regex::new(r"--(?:input|output) \d+:\d+/(?:tcp|udp)").unwrap();
+    let regex = Regex::new(r"--(?:inbound|outbound) \d+:\d+/(?:tcp|udp)").unwrap();
 
     let mut input_settings = HashMap::new();
     let mut output_settings = HashMap::new();
@@ -70,14 +70,14 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
             _ => continue
         };
         match input_or_output {
-            "--input" => {
+            "--inbound" => {
                 input_settings.insert(format!("{host_port}:{remote_host_port}"), PortSettings {
                     protocol,
                     host_port,
                     remote_host_port,
                 });
             }
-            "--output" => {
+            "--outbound" => {
                 output_settings.insert(format!("{host_port}:{remote_host_port}"), PortSettings {
                     protocol,
                     host_port,
@@ -93,14 +93,14 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
     let received_syn_ack = &AtomicBool::new(false);
     let inputs_finished = &AtomicBool::new(false);
     let (inputs_ack_tx, inputs_ack_rx) = std::sync::mpsc::channel();
-    let (reader_to_handler_sender_source, _) = channel(1024);
-    let reader_to_handler_sender_dest = reader_to_handler_sender_source.clone();
+    let (datagram_handler_sender, _) = channel(1024);
+    let datagram_handler_sender_dest = datagram_handler_sender.clone();
     let (handler_to_writer_sender_to_clone, _) = channel(1024);
     let (input_clients_sender, receiver) = tokio::sync::mpsc::channel(1024);
 
     tokio::join!(
         async{
-            tokio::spawn(datagram_handler(reader_to_handler_sender_dest,handler_to_writer_sender_to_clone.clone(),input_clients_sender,output_settings));
+            tokio::spawn(datagram_handler(datagram_handler_sender_dest,handler_to_writer_sender_to_clone.clone(),input_clients_sender,output_settings));
             tokio::spawn(datagram_from_local_client_to_tunnel_wrapper(socket_std.try_clone().unwrap(), handler_to_writer_sender_to_clone.clone()));
             tokio::spawn(input_clients_handler(handler_to_writer_sender_to_clone.clone(),receiver, input_settings_clone));
             delivery_syn(socket_std.try_clone().unwrap(),received_syn_ack).await;
@@ -113,7 +113,7 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
 
 
         },
-        socket_read_loop_wrapper(socket_std.try_clone().unwrap(),received_syn_ack,inputs_finished,&inputs_ack_tx,&reader_to_handler_sender_source),
+        socket_read_loop_wrapper(socket_std.try_clone().unwrap(),received_syn_ack,inputs_finished,&inputs_ack_tx,&datagram_handler_sender),
     );
 }
 
@@ -163,8 +163,8 @@ async fn delivery_input_ports(socket_std: std::net::UdpSocket, input_settings: &
 }
 
 
-async fn datagram_handler(reader_sender: Sender<ControlDatagram>, writer_sender: Sender<ControlDatagram>, input_clients_sender: tokio::sync::mpsc::Sender<ControlDatagram>, output_settings: HashMap<String, PortSettings>) {
-    let mut receiver = reader_sender.subscribe();
+async fn datagram_handler(datagram_handler_sender: Sender<ControlDatagram>, writer_sender: Sender<ControlDatagram>, input_clients_sender: tokio::sync::mpsc::Sender<ControlDatagram>, output_settings: HashMap<String, PortSettings>) {
+    let mut receiver = datagram_handler_sender.subscribe();
     loop {
         match receiver.recv().await {
             Ok(datagram) => {
@@ -197,7 +197,7 @@ async fn datagram_handler(reader_sender: Sender<ControlDatagram>, writer_sender:
                                         //     warn!("already open {port}/tcp");
                                         //     continue;
                                         // }
-                                        let reader_sender_clone = reader_sender.clone();
+                                        let reader_sender_clone = datagram_handler_sender.clone();
                                         let writer_sender_clone = writer_sender.clone();
                                         tokio::spawn(async move {
                                             let address;
@@ -230,7 +230,7 @@ async fn datagram_handler(reader_sender: Sender<ControlDatagram>, writer_sender:
                                         //     warn!("already open {port}/udp");
                                         //     continue;
                                         // }
-                                        let reader_sender_clone = reader_sender.clone();
+                                        let reader_sender_clone = datagram_handler_sender.clone();
                                         let writer_sender_clone = writer_sender.clone();
                                         tokio::spawn(async move {
                                             let address: SocketAddr;
@@ -266,6 +266,9 @@ async fn datagram_handler(reader_sender: Sender<ControlDatagram>, writer_sender:
                         }
                     }
                     "server_data" => {
+                        // it is going to be handled by output server
+                    }
+                    "ACK" => {
                         // it is going to be handled by output server
                     }
                     "client_data" => {
@@ -440,13 +443,13 @@ async fn datagram_from_local_client_to_tunnel_wrapper(socket_std: std::net::UdpS
     }
 }
 
-async fn socket_read_loop_wrapper(socket_std: std::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, sender: &Sender<ControlDatagram>) {
+async fn socket_read_loop_wrapper(socket_std: std::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
     loop {
-        socket_read_loop(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), received_syn_ack, inputs_finished, inputs_sender, sender).await
+        socket_read_loop(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), received_syn_ack, inputs_finished, inputs_sender, datagram_handler_sender).await
     }
 }
 
-async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, reader_to_handler_sender: &Sender<ControlDatagram>) {
+async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
     let mut buff = [0; 10240];
     match socket.recv(&mut buff).await {
         Ok(size) => {
@@ -479,6 +482,15 @@ async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &Atom
                                                 error!("could not send ACK for handling: {:?}", control_datagram)
                                             }
                                         }
+                                    }else{
+                                        match datagram_handler_sender.send(control_datagram.clone()){
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                let r#type = control_datagram.r#type.as_str().to_string();
+                                                let id = control_datagram.content.get("id").cloned().unwrap_or("None".to_string());
+                                                error!("could not send datagram for handling: {:?}{{id:{}}}", r#type, id);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {
@@ -494,7 +506,7 @@ async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &Atom
                                     }
                                     let r#type = control_datagram.r#type.as_str().to_string();
                                     let id_option_str = id_option.and_then(|text| Some(text.to_string()));
-                                    match reader_to_handler_sender.send(control_datagram) {
+                                    match datagram_handler_sender.send(control_datagram) {
                                         Ok(_) => {}
                                         Err(_) => {
                                             match id_option_str {

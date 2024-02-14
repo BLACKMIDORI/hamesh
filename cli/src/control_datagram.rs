@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
-use crate::settings_models::{ClientDataSettings,PortSettings, Protocol, ServerDataSettings};
+use crate::settings_models::{ClientDataSettings, PortSettings, Protocol, ServerDataSettings};
 
-#[derive(Debug, Deserialize, Serialize,Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlDatagram {
     pub version: i32,
@@ -19,10 +19,10 @@ impl ControlDatagram {
         content.insert("id".to_string(), id.to_string());
         ControlDatagram { version: 1, r#type: "ACK".to_string(), content }
     }
-    pub fn input_port(id: &str,settings: PortSettings)->ControlDatagram {
+    pub fn input_port(id: &str, settings: PortSettings) -> ControlDatagram {
         let mut content = HashMap::new();
-        content.insert("id".to_string(),  id.to_string());
-        content.insert("protocol".to_string(),  match settings.protocol {
+        content.insert("id".to_string(), id.to_string());
+        content.insert("protocol".to_string(), match settings.protocol {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp"
         }.to_string());
@@ -31,14 +31,15 @@ impl ControlDatagram {
         ControlDatagram {
             version: 1,
             r#type: "input_port".to_string(),
-            content
+            content,
         }
     }
 
-    pub fn client_data(id: &str,settings: ClientDataSettings,base64: &str)->ControlDatagram {
+    pub fn client_data(id: &str, sequence: u64, settings: ClientDataSettings, base64: &str) -> ControlDatagram {
         let mut content = HashMap::new();
-        content.insert("id".to_string(),  id.to_string());
-        content.insert("protocol".to_string(),  match settings.protocol {
+        content.insert("id".to_string(), id.to_string());
+        content.insert("sequence".to_string(), sequence.to_string());
+        content.insert("protocol".to_string(), match settings.protocol {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp"
         }.to_string());
@@ -48,14 +49,15 @@ impl ControlDatagram {
         ControlDatagram {
             version: 1,
             r#type: "client_data".to_string(),
-            content
+            content,
         }
     }
 
-    pub fn server_data(id: &str,settings: ServerDataSettings,base64: &str)->ControlDatagram {
+    pub fn server_data(id: &str, sequence: u64,  settings: ServerDataSettings, base64: &str) -> ControlDatagram {
         let mut content = HashMap::new();
-        content.insert("id".to_string(),  id.to_string());
-        content.insert("protocol".to_string(),  match settings.protocol {
+        content.insert("id".to_string(), id.to_string());
+        content.insert("sequence".to_string(), sequence.to_string());
+        content.insert("protocol".to_string(), match settings.protocol {
             Protocol::Tcp => "tcp",
             Protocol::Udp => "udp"
         }.to_string());
@@ -65,7 +67,7 @@ impl ControlDatagram {
         ControlDatagram {
             version: 1,
             r#type: "server_data".to_string(),
-            content
+            content,
         }
     }
 }

@@ -46,13 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let joined = format!("hamash {}", args[1..].join(" "));
-    let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:input|output) \d+:\d+/(?:tcp|udp))*$").unwrap();
+    let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:inbound|outbound) \d+:\d+/(?:tcp|udp))*$").unwrap();
     if !regex.is_match(joined.as_str()) {
         show_help_message();
         return Ok(());
     }
-    if !joined.contains("--input") && !joined.contains("--output") {
-        print!("Provide at least one --input or --output argument");
+    if !joined.contains("--inbound") && !joined.contains("--outbound") {
+        print!("Provide at least one --inbound or --outbound argument");
         return Ok(());
     }
     let ip_version_str = &args[2];
@@ -147,10 +147,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn show_help_message() {
     print!("\
-Usage: hamesh p2p <ip_version: ipv4|ipv6> [--input <host_port>:<remote_host_port>/<protocol: tcp|udp>...] [--output <host_port>:<remote_host_port>/<protocol: tcp|udp>...]\n\
+Usage: hamesh p2p <ip_version: ipv4|ipv6> [--inbound <host_port>:<remote_host_port>/<protocol: tcp|udp>...] [--outbound <host_port>:<remote_host_port>/<protocol: tcp|udp>...]\n\
 \n\
-Server Example: hamesh p2p ipv6 --input 25565:1234/tcp\n\
-Client Example: hamesh p2p ipv6 --output 1234:25565/tcp\
+Server Example: hamesh p2p ipv6 --inbound 25565:1234/tcp\n\
+Client Example: hamesh p2p ipv6 --outbound 1234:25565/tcp\
 ")
 }
 
