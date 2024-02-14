@@ -1,11 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use log::{error, info};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -108,7 +106,7 @@ impl OutputServer {
                             let mut receiver = broadcast_sender.subscribe();
                             let result = server_socket.accept().await;
                             match result {
-                                Ok((mut tcp_stream, local_client_address)) => {
+                                Ok(( tcp_stream, local_client_address)) => {
                                     let (mut read_stream, mut write_stream) = tcp_stream.into_split();
                                     let host_client_port = local_client_address.port();
                                     let tunnel_sender = tunnel_sender_to_clone.clone();
@@ -260,11 +258,11 @@ impl OutputServer {
                 match server_socket_result {
                     Ok(server_socket) => {
                         info!("listening on {}/udp",server.address);
-                        let sender = server.writer_sender.clone();
+                        let _sender = server.writer_sender.clone();
                         let mut buffer = [0; 10240];
                         loop {
                             match server_socket.recv_from(&mut buffer).await {
-                                Ok((size, local_client_address)) => {
+                                Ok((size, _local_client_address)) => {
                                     info!("UDP parser not implemented yet, size = {}",size)
                                 }
                                 Err(error) => {
@@ -283,6 +281,7 @@ impl OutputServer {
 }
 
 
+// TODO: improve memory usage
 async fn handle_retry(is_closed: Arc<Mutex<bool>>, tunnel_sender: Sender<ControlDatagram>, pre_tunnel_sender: Sender<ControlDatagram>, ack_sender: Sender<ControlDatagram>) {
     let mut pre_tunnel_receiver = pre_tunnel_sender.subscribe();
     loop {
@@ -298,7 +297,7 @@ async fn handle_retry(is_closed: Arc<Mutex<bool>>, tunnel_sender: Sender<Control
                             let tunnel_sender_clone = tunnel_sender.clone();
                             let is_closed = is_closed.clone();
                             let mut ack_receiver = ack_sender.subscribe();
-                            tokio::spawn(async move {
+                            let ack_handler = tokio::spawn(async move {
                                 loop{
                                     match ack_receiver.recv().await{
                                         Ok(datagram) => {
@@ -332,6 +331,7 @@ async fn handle_retry(is_closed: Arc<Mutex<bool>>, tunnel_sender: Sender<Control
                                     }
                                     interval.tick().await;
                                     if *received_ack2.lock().await || *is_closed.lock().await {
+                                        ack_handler.abort();
                                         break;
                                     }
                                 }

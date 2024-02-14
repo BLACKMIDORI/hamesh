@@ -2,16 +2,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast::{channel, Sender};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use futures::{SinkExt};
 use log::{error, info, warn};
 use regex::Regex;
-use serde_json::de::Read;
-use tokio::sync::broadcast::error::{RecvError, SendError};
 use tokio::time;
 use tokio::time::Instant;
 use crate::settings_models::{ClientDataSettings, PortSettings, Protocol};
@@ -143,12 +139,12 @@ async fn delivery_input_ports(socket_std: std::net::UdpSocket, input_settings: &
 
             match inputs_ack_rx.try_recv() {
                 Ok(id) => {
-                    let maybe_item = remaining_inputs.iter().find(|(key, value)| {
+                    let maybe_item = remaining_inputs.iter().find(|(key, _)| {
                         let local_id = format!("input_port_{}", key);
                         local_id == id
                     });
                     match maybe_item {
-                        Some((key, entry)) => {
+                        Some((key, _)) => {
                             remaining_inputs.remove(*key);
                         }
                         _ => {}
@@ -185,11 +181,11 @@ async fn datagram_handler(datagram_handler_sender: Sender<ControlDatagram>, writ
                             host_port: host_port_str.parse().unwrap(),
                             remote_host_port: remote_host_port_str.parse().unwrap(),
                         };
-                        let output_settings_option = output_settings.iter().find(|(key, settings)| {
+                        let output_settings_option = output_settings.iter().find(|(_, settings)| {
                             settings.protocol == input_settings.protocol && settings.remote_host_port == input_settings.host_port && settings.host_port == input_settings.remote_host_port
                         });
                         match output_settings_option {
-                            Some((key, output_settings)) => {
+                            Some((_, output_settings)) => {
                                 match output_settings.protocol {
                                     Protocol::Tcp => {
                                         let port = output_settings.host_port;
@@ -270,6 +266,14 @@ async fn datagram_handler(datagram_handler_sender: Sender<ControlDatagram>, writ
                     }
                     "ACK" => {
                         // it is going to be handled by output server
+
+                        // send also to input clients
+                        match input_clients_sender.send(datagram).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                error!("could not send the received client data to broadcast: {}",error)
+                            }
+                        }
                     }
                     "client_data" => {
                         match input_clients_sender.send(datagram).await {
@@ -318,6 +322,9 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                         Some(data)=>{
                     let input_settings = data.input_settings;
                     let datagram = data.datagram;
+                            match datagram.r#type.as_str(){
+                                "client_data"=>{
+
                     let content = &datagram.content;
                     let protocol_str = datagram.content["protocol"].as_str();
                     let host_port_str = datagram.content["hostPort"].as_str();
@@ -334,10 +341,7 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                         host_port: host_port_str.parse().unwrap(),
                         host_client_port: host_client_port_str.parse().unwrap(),
                     };
-                    let data_base64 = datagram.content["base64"].as_str();
-                    let data_result = base64::decode(data_base64);
-                    match data_result{
-                        Ok(data) => {
+
                             let client_id = format!("{}_{}_{}", protocol_str, client_data_settings.host_port, client_data_settings.host_client_port);
                             let mut client_option = clients.get(client_id.as_str()).cloned();
                             if client_option.is_none(){
@@ -349,17 +353,24 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                                 client.start(input_settings,tunnel_writer_sender.clone()).await;
                             }
                             let client = client_option.unwrap();
-                            match client.from_outside_tx.send(data){
+                            match client.from_outside_tx.send(datagram){
                                 Ok(_) => {}
                                 Err(error) => {
-                                    error!("could not send the received data to local server: {error}")
+                                    error!("could not send the received datagram to local server: {error}")
                                 }
                             }
-                        }
-                        Err(error) => {
-                            error!("could not decode remote client data: {error}")
-                        }
-                    }
+                                }
+                                "ACK"=>{
+                                    for (_,client) in clients.clone() {
+                            match client.from_outside_tx.send(datagram.clone()){
+                                Ok(_) => {}
+                                Err(error) => {
+                                    error!("could not send the received datagram to local server: {error}")
+                                }
+                            }
+                                    }
+                                }
+                            _ => {}}
                 }
                 None => {
                     error!("could not receive data from input clients channel: None");
@@ -401,12 +412,12 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                             host_port: host_port_str.parse().unwrap(),
                             host_client_port: host_client_port_str.parse().unwrap(),
                         };
-                        let input_settings_option = input_settings.iter().find(|(key, settings)| {
+                        let input_settings_option = input_settings.iter().find(|(_, settings)| {
                             settings.protocol == client_data_settings.protocol && settings.remote_host_port == client_data_settings.host_port
                         });
 
                         match input_settings_option {
-                            Some((key, input_settings)) => {
+                            Some((_, input_settings)) => {
                                 match sender.send(InputClientData {
                                     input_settings: input_settings.clone(),
                                     datagram,
@@ -419,6 +430,22 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                             }
                             None => {
                                 warn!("client data settings from remote host does not match any input settings: {:?}",input_settings);
+                            }
+                        }
+                    }
+                    "ACK"=>{
+                        // TODO: ACK does not have enough information about the target client
+                        match sender.send(InputClientData {
+                            input_settings: PortSettings{
+                                protocol: Protocol::Tcp,
+                                remote_host_port: 0,
+                                host_port: 0
+                            },
+                            datagram,
+                        }).await {
+                            Ok(_) => {}
+                            Err(error) => {
+                                error!("could not send data to input clients channel: {error}");
                             }
                         }
                     }
@@ -482,8 +509,8 @@ async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &Atom
                                                 error!("could not send ACK for handling: {:?}", control_datagram)
                                             }
                                         }
-                                    }else{
-                                        match datagram_handler_sender.send(control_datagram.clone()){
+                                    } else {
+                                        match datagram_handler_sender.send(control_datagram.clone()) {
                                             Ok(_) => {}
                                             Err(_) => {
                                                 let r#type = control_datagram.r#type.as_str().to_string();
