@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc};
 use std::time::Duration;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast::Sender;
@@ -106,7 +106,7 @@ impl OutputServer {
                             let mut receiver = broadcast_sender.subscribe();
                             let result = server_socket.accept().await;
                             match result {
-                                Ok(( tcp_stream, local_client_address)) => {
+                                Ok((tcp_stream, local_client_address)) => {
                                     let (mut read_stream, mut write_stream) = tcp_stream.into_split();
                                     let host_client_port = local_client_address.port();
                                     let tunnel_sender = tunnel_sender_to_clone.clone();
@@ -114,14 +114,14 @@ impl OutputServer {
                                     let (ack_sender, _) = tokio::sync::broadcast::channel(1024);
                                     let is_closed1 = Arc::new(Mutex::new(false));
                                     let is_closed2 = is_closed1.clone();
-                                    tokio::spawn(handle_retry(is_closed1, tunnel_sender, pre_tunnel_sender.clone(), ack_sender.clone()));
+                                    tokio::spawn(handle_retry(is_closed1, tunnel_sender.clone(), pre_tunnel_sender.clone(), ack_sender.clone()));
                                     let reader_handler = tokio::spawn(async move {
                                         let mut sequence: u64 = 0;
                                         let mut received_zero_bytes = false;
                                         loop {
                                             let id = format!("tcp_client_{host_port}_{host_client_port}_{sequence}");
-                                            let mut buff = [0; 10240];
-                                            match read_stream.read(&mut buff).await {
+                                            let mut buff = Vec::with_capacity(65535);
+                                            match read_stream.read_buf(&mut buff).await {
                                                 Ok(size) => {
                                                     if size == 0 {
                                                         if !received_zero_bytes {
@@ -174,12 +174,12 @@ impl OutputServer {
                                         )).expect("failed to signal the writer to close");
                                     });
                                     tokio::spawn(async move {
+                                        let mut sequence = 0;
                                         loop {
                                             match receiver.recv().await {
                                                 Ok(datagram) => {
                                                     match datagram.r#type.as_str() {
                                                         "server_data" => {
-                                                            // TODO: check sequence number and send ordered
                                                             let protocol_str = datagram.content["protocol"].as_str();
                                                             let remote_host_port_str = datagram.content["remoteHostPort"].as_str();
                                                             let remote_host_client_port_str = datagram.content["remoteHostClientPort"].as_str();
@@ -196,26 +196,59 @@ impl OutputServer {
                                                                 remote_host_client_port: remote_host_client_port_str.parse().unwrap(),
                                                             };
                                                             if server_data_settings.protocol == Protocol::Tcp && server_data_settings.remote_host_port == host_port && server_data_settings.remote_host_client_port == host_client_port {
-                                                                let data_base64 = datagram.content["base64"].as_str();
-                                                                let data_result = base64::decode(data_base64);
-                                                                match data_result {
-                                                                    Ok(data) => {
-                                                                        if data.is_empty() {
-                                                                            let id = datagram.content["id"].as_str();
-                                                                            if id == "close" {
-                                                                                break;
+                                                                let sequence_str = datagram.content.get("sequence").cloned().unwrap_or("-1".to_string());
+                                                                match sequence_str.parse::<u64>() {
+                                                                    Ok(received_sequence) => {
+                                                                        if received_sequence > sequence {
+                                                                            // TODO: persist datagram instead of discarding
+                                                                            // blocking ACK reply, in order to receive retransmission
+                                                                            warn!("sequence out of order. discarded. expected: {sequence} received: {received_sequence}")
+                                                                        } else {
+                                                                            // if received_sequence <= sequence
+                                                                            let id_option = datagram.content.get("id");
+                                                                            match id_option {
+                                                                                Some(id) => {
+                                                                                    info!("🔻 RECEIVED {}{{id:{}}}", datagram.r#type,id);
+                                                                                    match tunnel_sender.send(ControlDatagram::ack(id)) {
+                                                                                        Ok(_) => {}
+                                                                                        Err(error) => {
+                                                                                            error!("failed to send the ACK of {}{{id:{}}}: {}",datagram.r#type,id,error)
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                None => {
+                                                                                    warn!("🔻 RECEIVED {} without id. Cannot send ACK.", datagram.r#type);
+                                                                                }
                                                                             }
-                                                                        }
+                                                                            if received_sequence == sequence{
+                                                                                sequence += 1;
+                                                                                let data_base64 = datagram.content["base64"].as_str();
+                                                                                let data_result = base64::decode(data_base64);
+                                                                                match data_result {
+                                                                                    Ok(data) => {
+                                                                                        if data.is_empty() {
+                                                                                            let id = datagram.content["id"].as_str();
+                                                                                            if id == "close" {
+                                                                                                break;
+                                                                                            }
+                                                                                        }
 
-                                                                        match write_stream.write(data.as_slice()).await {
-                                                                            Ok(_) => {}
-                                                                            Err(error) => {
-                                                                                error!("could not send the received data to local client: {error}")
+                                                                                        match write_stream.write(data.as_slice()).await {
+                                                                                            Ok(_) => {}
+                                                                                            Err(error) => {
+                                                                                                error!("could not send the received data to local client: {error}")
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                    Err(error) => {
+                                                                                        error!("could not decode remote server data: {error}")
+                                                                                    }
+                                                                                }
                                                                             }
                                                                         }
                                                                     }
                                                                     Err(error) => {
-                                                                        error!("could not decode remote server data: {error}")
+                                                                        error!("invalid sequence: {error}");
                                                                     }
                                                                 }
                                                             }
@@ -259,9 +292,9 @@ impl OutputServer {
                     Ok(server_socket) => {
                         info!("listening on {}/udp",server.address);
                         let _sender = server.writer_sender.clone();
-                        let mut buffer = [0; 10240];
+                        let mut buff = Vec::with_capacity(65535);
                         loop {
-                            match server_socket.recv_from(&mut buffer).await {
+                            match server_socket.recv_buf_from(&mut buff).await {
                                 Ok((size, _local_client_address)) => {
                                     info!("UDP parser not implemented yet, size = {}",size)
                                 }
@@ -285,67 +318,66 @@ impl OutputServer {
 async fn handle_retry(is_closed: Arc<Mutex<bool>>, tunnel_sender: Sender<ControlDatagram>, pre_tunnel_sender: Sender<ControlDatagram>, ack_sender: Sender<ControlDatagram>) {
     let mut pre_tunnel_receiver = pre_tunnel_sender.subscribe();
     loop {
-        // Send 10 datagrams a time
-        for _ in 0..10 {
-            match pre_tunnel_receiver.recv().await {
-                Ok(datagram) => {
-                    let datagram_id_option = datagram.content.get("id").cloned();
-                    match datagram_id_option {
-                        Some(datagram_id) => {
-                            let received_ack1 = Arc::new(Mutex::new(false));
-                            let received_ack2 = received_ack1.clone();
-                            let tunnel_sender_clone = tunnel_sender.clone();
-                            let is_closed = is_closed.clone();
-                            let mut ack_receiver = ack_sender.subscribe();
-                            let ack_handler = tokio::spawn(async move {
-                                loop{
-                                    match ack_receiver.recv().await{
-                                        Ok(datagram) => {
-                                            match datagram.r#type.as_str(){
-                                                "ACK"=>{
-                                                    let id = datagram.content["id"].clone();
-                                                    if id == datagram_id{
-                                                        let mut received_ack_mutex = received_ack1.lock().await;
-                                                        *received_ack_mutex = true;
-                                                    }
-                                                }
-                                                _=>{
-                                                    error!("datagram is not ACK: {}", datagram.r#type);
+        match pre_tunnel_receiver.recv().await {
+            Ok(datagram) => {
+                let datagram_id_option = datagram.content.get("id").cloned();
+                match datagram_id_option {
+                    Some(datagram_id) => {
+                        let received_ack1 = Arc::new(Mutex::new(false));
+                        let received_ack2 = received_ack1.clone();
+                        let tunnel_sender_clone = tunnel_sender.clone();
+                        let is_closed = is_closed.clone();
+                        let mut ack_receiver = ack_sender.subscribe();
+                        let ack_handler = tokio::spawn(async move {
+                            loop {
+                                match ack_receiver.recv().await {
+                                    Ok(datagram) => {
+                                        match datagram.r#type.as_str() {
+                                            "ACK" => {
+                                                let id = datagram.content["id"].clone();
+                                                if id == datagram_id {
+                                                    let mut received_ack_mutex = received_ack1.lock().await;
+                                                    *received_ack_mutex = true;
                                                 }
                                             }
+                                            _ => {
+                                                error!("datagram is not ACK: {}", datagram.r#type);
+                                            }
                                         }
-                                        Err(error) => {
-                                            error!("[recv]could not receive ACK for retry handling: {}", error);
-                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("[recv]could not receive ACK for retry handling: {}", error);
                                     }
                                 }
-                            });
-                            tokio::spawn(async move {
-                                let mut interval = time::interval(Duration::from_millis(10));
-                                loop {
-                                    match tunnel_sender_clone.send(datagram.clone()) {
-                                        Ok(_) => {}
-                                        Err(error) => {
-                                            error!("[send]could not send local client data to tunnel: {}", error);
-                                        }
-                                    }
-                                    interval.tick().await;
-                                    if *received_ack2.lock().await || *is_closed.lock().await {
-                                        ack_handler.abort();
-                                        break;
+                            }
+                        });
+                        tokio::spawn(async move {
+                            // TODO: use the max latency as interval
+                            let mut interval = time::interval(Duration::from_millis(20));
+                            const MAX_RETRIES: i32 = 500;
+                            for _ in 0..MAX_RETRIES {
+                                match tunnel_sender_clone.send(datagram.clone()) {
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        error!("[send]could not send local client data to tunnel: {}", error);
                                     }
                                 }
-                            });
-                        }
-                        None => {
-                            error! {"cannot handle retry for datagram without id"}
-                            let _ = tunnel_sender.clone().send(datagram.clone());
-                        }
+                                interval.tick().await;
+                                if *received_ack2.lock().await || *is_closed.lock().await {
+                                    ack_handler.abort();
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        error! {"cannot handle retry for datagram without id"}
+                        let _ = tunnel_sender.clone().send(datagram.clone());
                     }
                 }
-                Err(error) => {
-                    error!("[recv]could not send local client data to tunnel: {}", error);
-                }
+            }
+            Err(error) => {
+                error!("[recv]could not send local client data to tunnel: {}", error);
             }
         }
     }

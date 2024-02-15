@@ -1,15 +1,11 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast::{channel, Sender};
-use std::task::{Context, Poll};
 use std::time::Duration;
 use log::{error, info, warn};
 use regex::Regex;
 use tokio::time;
-use tokio::time::Instant;
 use crate::settings_models::{ClientDataSettings, PortSettings, Protocol};
 use crate::control_datagram::ControlDatagram;
 use crate::get_ip_version::get_ip_version;
@@ -17,26 +13,6 @@ use crate::input_client::InputClient;
 use crate::ip_version::IpVersion;
 use crate::output_server::{OutputServer, OutputServerConfigTcp, OutputServerConfigUdp};
 
-struct Delay {
-    when: Instant,
-}
-
-impl Future for Delay {
-    type Output = &'static str;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>)
-            -> Poll<&'static str>
-    {
-        if Instant::now() >= self.when {
-            println!("Hello world");
-            Poll::Ready("done")
-        } else {
-            // Ignore this line for now.
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
 
 pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: SocketAddr, dest_peer: SocketAddr) {
     let socket = tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap();
@@ -102,13 +78,8 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
             delivery_syn(socket_std.try_clone().unwrap(),received_syn_ack).await;
             delivery_input_ports(socket_std.try_clone().unwrap(), &input_settings, &inputs_ack_rx).await;
              inputs_finished.store(true, Ordering::Relaxed);
-           let when =Instant::now() + Duration::from_secs(2);
-            Delay{ when}.await;
-    let datagram_bytes = serde_json::to_vec(&ControlDatagram{r#type: "heart_beat".to_string(),version:1,content: HashMap::new()}).unwrap();
-    socket.send(datagram_bytes.as_slice()).await.expect(format!("Failed to send {}", "heart_beat").as_str());
-
-
         },
+
         socket_read_loop_wrapper(socket_std.try_clone().unwrap(),received_syn_ack,inputs_finished,&inputs_ack_tx,&datagram_handler_sender),
     );
 }
@@ -433,13 +404,13 @@ async fn input_clients_handler(tunnel_writer_sender: Sender<ControlDatagram>, mu
                             }
                         }
                     }
-                    "ACK"=>{
+                    "ACK" => {
                         // TODO: ACK does not have enough information about the target client
                         match sender.send(InputClientData {
-                            input_settings: PortSettings{
+                            input_settings: PortSettings {
                                 protocol: Protocol::Tcp,
                                 remote_host_port: 0,
-                                host_port: 0
+                                host_port: 0,
                             },
                             datagram,
                         }).await {
@@ -477,8 +448,8 @@ async fn socket_read_loop_wrapper(socket_std: std::net::UdpSocket, received_syn_
 }
 
 async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
-    let mut buff = [0; 10240];
-    match socket.recv(&mut buff).await {
+    let mut buff = Vec::with_capacity(65535);
+    match socket.recv_buf(&mut buff).await {
         Ok(size) => {
             match std::str::from_utf8(&buff[..size]) {
                 Ok(data) => {
@@ -522,13 +493,15 @@ async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &Atom
                                 }
                                 _ => {
                                     let id_option = control_datagram.content.get("id");
-                                    match id_option {
-                                        Some(id) => {
-                                            info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type,id);
-                                            send_ack(socket, id).await
-                                        }
-                                        None => {
-                                            warn!("🔻 RECEIVED {} without id. Cannot send ACK.", control_datagram.r#type);
+                                    if control_datagram.r#type == "input_port" {
+                                        match id_option {
+                                            Some(id) => {
+                                                info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type,id);
+                                                send_ack(socket, id).await
+                                            }
+                                            None => {
+                                                warn!("🔻 RECEIVED {} without id. Cannot send ACK.", control_datagram.r#type);
+                                            }
                                         }
                                     }
                                     let r#type = control_datagram.r#type.as_str().to_string();
@@ -568,14 +541,24 @@ async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &Atom
 async fn send_syn(socket: tokio::net::UdpSocket) {
     let datagram = ControlDatagram::syn();
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
-    socket.send(datagram_bytes.as_slice()).await.expect("Failed to send SYN");
+    match socket.send(datagram_bytes.as_slice()).await{
+        Ok(_) => {}
+        Err(error) => {
+            error!("Failed to send SYN: {error}")
+        }
+    }
     info!(" ⃤ SENT SYN");
 }
 
 async fn send_ack(socket: tokio::net::UdpSocket, id: &str) {
     let datagram = ControlDatagram::ack(id);
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
-    socket.send(datagram_bytes.as_slice()).await.expect(format!("Failed to send {}", datagram.r#type).as_str());
+    match socket.send(datagram_bytes.as_slice()).await{
+        Ok(_) => {}
+        Err(error) => {
+            error!("Failed to send {}: {error}", datagram.r#type)
+        }
+    }
     info!(" ⃤ SENT ACK{{id:{}}}", id);
 }
 
@@ -589,12 +572,22 @@ async fn send_input_port(socket: tokio::net::UdpSocket, id: &str, port_settings:
         remote_host_port: port_settings.remote_host_port,
     });
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
-    socket.send(datagram_bytes.as_slice()).await.expect(format!("Failed to send {}", datagram.r#type).as_str());
+    match socket.send(datagram_bytes.as_slice()).await{
+        Ok(_) => {}
+        Err(error) => {
+            error!("Failed to send {}: {error}", datagram.r#type)
+        }
+    }
     info!(" ⃤ SENT {}{{id:{}}}",datagram.r#type, datagram.content["id"]);
 }
 
 async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: ControlDatagram) {
     let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
-    socket.send(datagram_bytes.as_slice()).await.expect(format!("Failed to send {}", datagram.r#type).as_str());
+    match socket.send(datagram_bytes.as_slice()).await{
+        Ok(_) => {}
+        Err(error) => {
+            error!("Failed to send {}: {error}", datagram.r#type)
+        }
+    }
     info!(" ⃤ SENT {}{{id:{}}}",datagram.r#type, datagram.content.get("id").unwrap_or(&"null".to_string()));
 }
