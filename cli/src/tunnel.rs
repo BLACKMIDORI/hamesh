@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast::{channel, Sender};
@@ -80,7 +80,7 @@ pub async fn establish_connection(socket_std: std::net::UdpSocket, source_peer: 
              inputs_finished.store(true, Ordering::Relaxed);
         },
 
-        socket_read_loop_wrapper(socket_std.try_clone().unwrap(),received_syn_ack,inputs_finished,&inputs_ack_tx,&datagram_handler_sender),
+        socket_read_loop(socket_std.try_clone().unwrap(),received_syn_ack,inputs_finished,&inputs_ack_tx,&datagram_handler_sender),
     );
 }
 
@@ -441,101 +441,151 @@ async fn datagram_from_local_client_to_tunnel_wrapper(socket_std: std::net::UdpS
     }
 }
 
-async fn socket_read_loop_wrapper(socket_std: std::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
-    loop {
-        socket_read_loop(tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap(), received_syn_ack, inputs_finished, inputs_sender, datagram_handler_sender).await
-    }
-}
 
-async fn socket_read_loop(socket: tokio::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
-    let mut buff = Vec::with_capacity(65535);
-    match socket.recv_buf(&mut buff).await {
-        Ok(size) => {
-            match std::str::from_utf8(&buff[..size]) {
-                Ok(data) => {
-                    match serde_json::from_str::<ControlDatagram>(data) {
-                        Ok(control_datagram) => {
-                            if control_datagram.version != 1 {
-                                error!("🔻 RECEIVED {} with unrecognized version", control_datagram.r#type);
-                                panic!("unrecognized version")
-                            }
-                            match control_datagram.r#type.as_str() {
-                                "SYN" => {
-                                    info!("🔻 RECEIVED {}", control_datagram.r#type);
-                                    send_ack(socket, "SYN").await
+async fn socket_read_loop(socket_std: std::net::UdpSocket, received_syn_ack: &AtomicBool, inputs_finished: &AtomicBool, inputs_sender: &std::sync::mpsc::Sender<String>, datagram_handler_sender: &Sender<ControlDatagram>) {
+    let mut fragment_datagrams:VecDeque<ControlDatagram> = VecDeque::new();
+    loop{
+        if fragment_datagrams.len()>100{
+            fragment_datagrams.pop_back();
+        }
+        let socket = tokio::net::UdpSocket::from_std(socket_std.try_clone().unwrap()).unwrap();
+        let mut buff = Vec::with_capacity(65535);
+        match socket.recv_buf(&mut buff).await {
+            Ok(size) => {
+                match std::str::from_utf8(&buff[..size]) {
+                    Ok(data) => {
+                        match serde_json::from_str::<ControlDatagram>(data) {
+                            Ok(maybe_fragment) => {
+                                if maybe_fragment.version != 1 {
+                                    error!("🔻 RECEIVED {} with unrecognized version", maybe_fragment.r#type);
+                                    panic!("unrecognized version")
                                 }
-                                "ACK" => {
-                                    info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type, control_datagram.content["id"]);
-                                    if control_datagram.content["id"] == "SYN" {
-                                        if !received_syn_ack.load(Ordering::Relaxed) {
-                                            received_syn_ack.store(true, Ordering::Relaxed);
-                                            info!("✅  connection established!")
+                                let mut actual_datagram = Some(maybe_fragment.clone());
+                                if maybe_fragment.r#type == "fragment"{
+                                    actual_datagram = None;
+                                    if maybe_fragment.content["contentType"] == "control_datagram" {
+                                        let index:i32 = maybe_fragment.content["index"].clone().parse().unwrap();
+                                        let digest = maybe_fragment.content["digest"].clone();
+                                        if !fragment_datagrams.iter().any(|fragment_datagram|{
+                                            fragment_datagram.content["digest"] == digest && fragment_datagram.content["index"] == maybe_fragment.content["index"]
+                                        }){
+                                            fragment_datagrams.push_front(maybe_fragment.clone());
                                         }
-                                    } else if !inputs_finished.load(Ordering::Relaxed) {
-                                        match inputs_sender.send(control_datagram.content["id"].to_string()) {
-                                            Ok(_) => {
-                                                info!("sent ACK for inputs handling");
+                                        let length:i32 = maybe_fragment.content["length"].clone().parse().unwrap();
+                                        if index == length-1{
+                                            let mut fragments_data_list = Vec::with_capacity(length as usize);
+                                            for _ in 0..length{
+                                                fragments_data_list.push(None);
                                             }
-                                            Err(_) => {
-                                                error!("could not send ACK for handling: {:?}", control_datagram)
+                                            for fragment_datagram in fragment_datagrams.clone() {
+                                                if fragment_datagram.content["digest"] == digest{
+                                                    let fragment_index: i32 = fragment_datagram.content["index"].parse().unwrap();
+                                                    fragments_data_list[fragment_index as usize] = Some(fragment_datagram.content["data"].clone());
+                                                }
+                                            }
+                                            if fragments_data_list.iter().all(|option|option.is_some()){
+                                                let mut restored_data = String::from("");
+                                                for fragment_data in fragments_data_list{
+                                                    restored_data.push_str(fragment_data.unwrap().as_str())
+                                                }
+                                                let control_datagram_result = serde_json::from_str::<ControlDatagram>(restored_data.as_str());
+                                                match control_datagram_result {
+                                                    Ok(control_datagram) => {
+                                                        actual_datagram = Some(control_datagram);
+                                                    }
+                                                    Err(error) => {
+                                                        error!("could not parse control datagram from fragments: {error}")
+                                                    }
+                                                }
                                             }
                                         }
-                                    } else {
-                                        match datagram_handler_sender.send(control_datagram.clone()) {
-                                            Ok(_) => {}
-                                            Err(_) => {
+                                    }
+                                }
+                                match actual_datagram{
+                                    Some(control_datagram) => {
+                                        match control_datagram.r#type.as_str() {
+                                            "SYN" => {
+                                                info!("🔻 RECEIVED {}", control_datagram.r#type);
+                                                send_ack(socket, "SYN").await
+                                            }
+                                            "ACK" => {
+                                                info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type, control_datagram.content["id"]);
+                                                if control_datagram.content["id"] == "SYN" {
+                                                    if !received_syn_ack.load(Ordering::Relaxed) {
+                                                        received_syn_ack.store(true, Ordering::Relaxed);
+                                                        info!("✅  connection established!")
+                                                    }
+                                                } else if !inputs_finished.load(Ordering::Relaxed) {
+                                                    match inputs_sender.send(control_datagram.content["id"].to_string()) {
+                                                        Ok(_) => {
+                                                            info!("sent ACK for inputs handling");
+                                                        }
+                                                        Err(_) => {
+                                                            error!("could not send ACK for handling: {:?}", control_datagram)
+                                                        }
+                                                    }
+                                                } else {
+                                                    match datagram_handler_sender.send(control_datagram.clone()) {
+                                                        Ok(_) => {}
+                                                        Err(_) => {
+                                                            let r#type = control_datagram.r#type.as_str().to_string();
+                                                            let id = control_datagram.content.get("id").cloned().unwrap_or("None".to_string());
+                                                            error!("could not send datagram for handling: {:?}{{id:{}}}", r#type, id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                let id_option = control_datagram.content.get("id");
+                                                if control_datagram.r#type == "input_port" {
+                                                    match id_option {
+                                                        Some(id) => {
+                                                            info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type,id);
+                                                            send_ack(socket, id).await
+                                                        }
+                                                        None => {
+                                                            warn!("🔻 RECEIVED {} without id. Cannot send ACK.", control_datagram.r#type);
+                                                        }
+                                                    }
+                                                }
                                                 let r#type = control_datagram.r#type.as_str().to_string();
-                                                let id = control_datagram.content.get("id").cloned().unwrap_or("None".to_string());
-                                                error!("could not send datagram for handling: {:?}{{id:{}}}", r#type, id);
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    let id_option = control_datagram.content.get("id");
-                                    if control_datagram.r#type == "input_port" {
-                                        match id_option {
-                                            Some(id) => {
-                                                info!("🔻 RECEIVED {}{{id:{}}}", control_datagram.r#type,id);
-                                                send_ack(socket, id).await
-                                            }
-                                            None => {
-                                                warn!("🔻 RECEIVED {} without id. Cannot send ACK.", control_datagram.r#type);
-                                            }
-                                        }
-                                    }
-                                    let r#type = control_datagram.r#type.as_str().to_string();
-                                    let id_option_str = id_option.and_then(|text| Some(text.to_string()));
-                                    match datagram_handler_sender.send(control_datagram) {
-                                        Ok(_) => {}
-                                        Err(_) => {
-                                            match id_option_str {
-                                                Some(id) => {
-                                                    error!("could not send datagram for handling: {:?}{{id:{}}}", r#type, id);
-                                                }
-                                                None => {
-                                                    error!("could not send datagram for handling: {:?}",r#type);
+                                                let id_option_str = id_option.and_then(|text| Some(text.to_string()));
+                                                match datagram_handler_sender.send(control_datagram) {
+                                                    Ok(_) => {}
+                                                    Err(_) => {
+                                                        match id_option_str {
+                                                            Some(id) => {
+                                                                error!("could not send datagram for handling: {:?}{{id:{}}}", r#type, id);
+                                                            }
+                                                            None => {
+                                                                error!("could not send datagram for handling: {:?}",r#type);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
+                                    }
+                                    None => {
+                                        info!("fragment received: [{}] {}",maybe_fragment.content.get("index").cloned().unwrap_or("index".to_string()), maybe_fragment.content.get("digest").cloned().unwrap_or("digest".to_string()));
                                     }
                                 }
                             }
-                        }
-                        _ => {
-                            warn!("unknown datagram: '{}'", data);
+                            _ => {
+                                warn!("malformed datagram: '{}'", data);
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    error!("{}", e);
+                    Err(e) => {
+                        error!("{}", e);
+                    }
                 }
             }
-        }
-        Err(e) => {
-            error!("socket.recv: {}", e);
-        }
-    };
+            Err(e) => {
+                error!("socket.recv: {}", e);
+            }
+        };
+    }
 }
 
 async fn send_syn(socket: tokio::net::UdpSocket) {
@@ -582,12 +632,27 @@ async fn send_input_port(socket: tokio::net::UdpSocket, id: &str, port_settings:
 }
 
 async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: ControlDatagram) {
-    let datagram_bytes = serde_json::to_vec(&datagram).unwrap();
-    match socket.send(datagram_bytes.as_slice()).await{
-        Ok(_) => {}
+    let parts_result = ControlDatagram::fragments(datagram.clone());
+    match parts_result{
+        Ok(parts) => {
+            let part_a = serde_json::to_vec(&parts[0]).unwrap();
+            let part_b = serde_json::to_vec(&parts[1]).unwrap();
+            match socket.send(part_a.as_slice()).await{
+                Ok(_) => {}
+                Err(error) => {
+                    error!("Failed to send {} (fragment index 0): {error}", datagram.r#type);
+                }
+            }
+            match socket.send(part_b.as_slice()).await{
+                Ok(_) => {}
+                Err(error) => {
+                    error!("Failed to send {} (fragment index 1): {error}", datagram.r#type);
+                }
+            }
+            info!(" ⃤ SENT {}{{id:{}}}",datagram.r#type, datagram.content.get("id").unwrap_or(&"null".to_string()));
+        }
         Err(error) => {
-            error!("Failed to send {}: {error}", datagram.r#type)
+            error!("could not split datagram into fragments: {error}")
         }
     }
-    info!(" ⃤ SENT {}{{id:{}}}",datagram.r#type, datagram.content.get("id").unwrap_or(&"null".to_string()));
 }

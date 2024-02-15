@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use sha256::digest;
 use crate::settings_models::{ClientDataSettings, PortSettings, Protocol, ServerDataSettings};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -69,5 +70,29 @@ impl ControlDatagram {
             r#type: "server_data".to_string(),
             content,
         }
+    }
+
+    fn fragment(digest: String, content_type: String, index: i32,length: i32,data: String)->ControlDatagram{
+        let mut content = HashMap::new();
+        content.insert("digest".to_string(), digest);
+        content.insert("contentType".to_string(), content_type);
+        content.insert("index".to_string(), index.to_string());
+        content.insert("length".to_string(), length.to_string());
+        content.insert("data".to_string(), data);
+        ControlDatagram{
+            version: 1,
+            r#type: "fragment".to_string(),
+            content
+        }
+    }
+    pub fn fragments(datagram: ControlDatagram)->Result<[ControlDatagram;2], serde_json::Error>{
+        let control_datagram_json= serde_json::to_string(&datagram)?;
+        let digest = digest(control_datagram_json.to_string());
+        let part_a = control_datagram_json[0..control_datagram_json.len()/2].to_string();
+        let part_b = control_datagram_json[control_datagram_json.len()/2..control_datagram_json.len()].to_string();
+        Ok([
+            ControlDatagram::fragment(digest.to_string(), "control_datagram".to_string(), 0,2, part_a),
+            ControlDatagram::fragment(digest.to_string(), "control_datagram".to_string(), 1,2, part_b),
+        ])
     }
 }
