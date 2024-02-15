@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Provide at least one --inbound or --outbound argument");
         return Ok(());
     }
+    info!("v0.0.1");
     let ip_version_str = &args[2];
     let ip_version = match ip_version_str.as_str() {
         "ipv4" => { IpVersion::Ipv4 }
