@@ -474,13 +474,16 @@ async fn socket_read_loop(socket_std: std::net::UdpSocket, received_syn_ack: &At
                                         let length:i32 = maybe_fragment.content["length"].clone().parse().unwrap();
                                         if index == length-1{
                                             let mut fragments_data_list = Vec::with_capacity(length as usize);
+                                            let mut to_remove = Vec::new();
                                             for _ in 0..length{
                                                 fragments_data_list.push(None);
                                             }
-                                            for fragment_datagram in fragment_datagrams.clone() {
+                                            for i in 0..fragment_datagrams.len() {
+                                                let fragment_datagram = fragment_datagrams[i].clone();
                                                 if fragment_datagram.content["digest"] == digest{
                                                     let fragment_index: i32 = fragment_datagram.content["index"].parse().unwrap();
                                                     fragments_data_list[fragment_index as usize] = Some(fragment_datagram.content["data"].clone());
+                                                    to_remove.push(i);
                                                 }
                                             }
                                             if fragments_data_list.iter().all(|option|option.is_some()){
@@ -492,6 +495,9 @@ async fn socket_read_loop(socket_std: std::net::UdpSocket, received_syn_ack: &At
                                                 match control_datagram_result {
                                                     Ok(control_datagram) => {
                                                         actual_datagram = Some(control_datagram);
+                                                        for i in to_remove {
+                                                            fragment_datagrams.remove(i);
+                                                        }
                                                     }
                                                     Err(error) => {
                                                         error!("could not parse control datagram from fragments: {error}")
@@ -637,17 +643,24 @@ async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: ControlDatagram
         Ok(parts) => {
             let part_a = serde_json::to_vec(&parts[0]).unwrap();
             let part_b = serde_json::to_vec(&parts[1]).unwrap();
-            match socket.send(part_a.as_slice()).await{
-                Ok(_) => {}
-                Err(error) => {
-                    error!("Failed to send {} (fragment index 0): {error}", datagram.r#type);
+            let mut interval = time::interval(Duration::from_millis(10));
+            for _ in 0..3 {
+                match socket.send(part_a.as_slice()).await {
+                    Ok(_) => {}
+                    Err(error) => {
+                        error!("Failed to send {} (fragment index 0): {error}", datagram.r#type);
+                    }
                 }
+                interval.tick().await;
             }
-            match socket.send(part_b.as_slice()).await{
-                Ok(_) => {}
-                Err(error) => {
-                    error!("Failed to send {} (fragment index 1): {error}", datagram.r#type);
+            for _ in 0..3{
+                match socket.send(part_b.as_slice()).await{
+                    Ok(_) => {}
+                    Err(error) => {
+                        error!("Failed to send {} (fragment index 1): {error}", datagram.r#type);
+                    }
                 }
+                interval.tick().await;
             }
             info!(" ⃤ SENT {}{{id:{}}}",datagram.r#type, datagram.content.get("id").unwrap_or(&"null".to_string()));
         }

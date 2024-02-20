@@ -1,10 +1,11 @@
-use std::net::SocketAddr;
+use std::net::{ SocketAddr};
 use std::sync::{Arc};
 use std::time::Duration;
 use log::{error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::broadcast::Sender;
+use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio::time;
 use crate::control_datagram::ControlDatagram;
@@ -70,7 +71,7 @@ impl OutputServer {
                             match broadcast_sender.send(datagram) {
                                 Ok(_) => {}
                                 Err(error) => {
-                                    error!("could not send to local client the received datagram: {}",error)
+                                    error!("could not send to local client the received datagram(server_data): {}",error)
                                 }
                             };
                         }
@@ -78,7 +79,7 @@ impl OutputServer {
                             match broadcast_sender.send(datagram) {
                                 Ok(_) => {}
                                 Err(error) => {
-                                    error!("could not send to local client the received datagram: {}",error)
+                                    error!("could not send to local client the received datagram(ACK): {}",error)
                                 }
                             };
                         }
@@ -220,7 +221,7 @@ impl OutputServer {
                                                                                     warn!("🔻 RECEIVED {} without id. Cannot send ACK.", datagram.r#type);
                                                                                 }
                                                                             }
-                                                                            if received_sequence == sequence{
+                                                                            if received_sequence == sequence {
                                                                                 sequence += 1;
                                                                                 let data_base64 = datagram.content["base64"].as_str();
                                                                                 let data_result = base64::decode(data_base64);
@@ -286,23 +287,147 @@ impl OutputServer {
                 }
             }
             OutputServer::Udp(server) => {
-                // TODO: implement UDP
                 let server_socket_result = UdpSocket::bind(server.address).await;
                 match server_socket_result {
                     Ok(server_socket) => {
                         info!("listening on {}/udp",server.address);
-                        let _sender = server.writer_sender.clone();
-                        let mut buff = Vec::with_capacity(65535);
-                        loop {
-                            match server_socket.recv_buf_from(&mut buff).await {
-                                Ok((size, _local_client_address)) => {
-                                    info!("UDP parser not implemented yet, size = {}",size)
+                        let host_port = server_socket.local_addr().unwrap().port();
+                        let tunnel_sender = server.writer_sender.clone();
+                        let mut receiver = broadcast_sender.subscribe();
+                        let (server_socket_sender, mut server_socket_sender_receiver) = channel::<(Vec<u8>,SocketAddr)>(1024);
+                        let (server_socket_receiver_sender, mut server_socket_receiver) = channel::<(Vec<u8>,usize,SocketAddr)>(1024);
+                        tokio::spawn(async move{
+                            tokio::join!(
+                                async{
+                                    loop{
+                                        let mut buff = Vec::with_capacity(65535);
+                                        match server_socket.recv_buf_from(&mut buff).await{
+                                            Ok((size,address)) => {
+                                                let _=server_socket_receiver_sender.send((buff,size, address)).await;
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                },
+                                async{
+                                    loop{
+                                        match server_socket_sender_receiver.recv().await{
+                                            Some((bytes,address)) => {
+                                                print!("{},{}\n",bytes.len(),address);
+                                                let _= server_socket.send_to(bytes.as_slice(),address).await;
+                                            }
+                                            None => {}
+                                        }
+                                    }
                                 }
-                                Err(error) => {
-                                    error!("could not read local client data: {}", error)
+                            )
+                        });
+                        tokio::spawn(async move {
+                            let mut sequence: u64 = 0;
+                            loop {
+                                match server_socket_receiver.recv().await {
+                                    Some((buff,size, udp_client)) => {
+                                        let host_client_port = udp_client.port();
+                                        let id = format!("udp_client_{host_port}_{host_client_port}_{sequence}");
+                                        if size == 0 {
+                                            info!("received 0 bytes from {}", udp_client);
+                                        }
+                                        let encoded_data = base64::encode(&buff[..size]);
+                                        let datagram = ControlDatagram::client_data(
+                                            id.as_str(),
+                                            sequence,
+                                            ClientDataSettings {
+                                                protocol: Protocol::Udp,
+                                                host_port,
+                                                host_client_port,
+                                            },
+                                            encoded_data.as_str(),
+                                        );
+                                        match tunnel_sender.send(datagram.clone()) {
+                                            Ok(_) => {}
+                                            Err(error) => {
+                                                error!("could not send local client data: {}", error);
+                                            }
+                                        }
+                                        sequence += 1;
+                                    }
+                                    None => {
+                                        error!("could not read local client data: None");
+                                        break;
+                                    }
+                                };
+                            }
+                        });
+                        tokio::spawn(async move {
+                            loop {
+                                match receiver.recv().await {
+                                    Ok(datagram) => {
+                                        match datagram.r#type.as_str() {
+                                            "server_data" => {
+                                                let id_option = datagram.content.get("id");
+                                                match id_option {
+                                                    Some(id) => {
+                                                        info!("🔻 RECEIVED {}{{id:{}}}", datagram.r#type,id);
+                                                    }
+                                                    None => {
+                                                        warn!("🔻 RECEIVED {} without id", datagram.r#type);
+                                                    }
+                                                }
+                                                let protocol_str = datagram.content["protocol"].as_str();
+                                                let remote_host_port_str = datagram.content["remoteHostPort"].as_str();
+                                                let remote_host_client_port_str = datagram.content["remoteHostClientPort"].as_str();
+                                                let server_data_settings = ServerDataSettings {
+                                                    protocol: match protocol_str {
+                                                        "tcp" => Protocol::Tcp,
+                                                        "udp" => Protocol::Udp,
+                                                        _ => {
+                                                            error!("invalid protocol {}", protocol_str);
+                                                            continue;
+                                                        }
+                                                    },
+                                                    remote_host_port: remote_host_port_str.parse().unwrap(),
+                                                    remote_host_client_port: remote_host_client_port_str.parse().unwrap(),
+                                                };
+                                                if server_data_settings.protocol == Protocol::Udp {
+                                                    let data_base64 = datagram.content["base64"].as_str();
+                                                    let data_result = base64::decode(data_base64);
+                                                    let dest_address;
+                                                    match server.address {
+                                                        SocketAddr::V4(_) => {
+                                                            dest_address = SocketAddr::V4(format!("127.0.0.1:{}", server_data_settings.remote_host_client_port).parse().unwrap());
+                                                        }
+                                                        SocketAddr::V6(_) => {
+                                                            dest_address = SocketAddr::V6(format!("[::1]:{}", server_data_settings.remote_host_client_port).parse().unwrap());
+                                                        }
+                                                    }
+                                                    match data_result {
+                                                        Ok(data) => {
+                                                            if data.is_empty() {
+                                                                warn!("received 0 bytes from server to {}",dest_address);
+                                                            }
+
+                                                            match server_socket_sender.send((data, dest_address)).await {
+                                                                Ok(_) => {}
+                                                                Err(error) => {
+                                                                    error!("could not send the received data to local client: {error}")
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            error!("could not decode remote server data: {error}")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Err(error) => {
+                                        error!("could not received data on the local client: {}",error)
+                                    }
                                 }
                             }
-                        }
+                        });
                     }
                     Err(error) => {
                         error!("could not start a udp server socket: {}",error)
