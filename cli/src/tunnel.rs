@@ -651,6 +651,14 @@ async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: ControlDatagram
                         error!("Failed to send {} (fragment index 0): {error}", datagram.r#type);
                     }
                 }
+                match datagram.content.get("protocol"){
+                    Some(protocol_str) => {
+                        if protocol_str == "tcp"{
+                            break;
+                        }
+                    }
+                    None => {}
+                }
                 interval.tick().await;
             }
             for _ in 0..3{
@@ -659,6 +667,14 @@ async fn send_datagram(socket: &tokio::net::UdpSocket, datagram: ControlDatagram
                     Err(error) => {
                         error!("Failed to send {} (fragment index 1): {error}", datagram.r#type);
                     }
+                }
+                match datagram.content.get("protocol"){
+                    Some(protocol_str) => {
+                        if protocol_str == "tcp"{
+                            break;
+                        }
+                    }
+                    None => {}
                 }
                 interval.tick().await;
             }
