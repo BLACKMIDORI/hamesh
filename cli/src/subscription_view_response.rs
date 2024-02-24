@@ -12,7 +12,7 @@ pub struct SubscriptionViewResponseValue {
     pub peers: Vec<SubscriptionPeer>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SubscriptionPeer {
     pub address: String,

@@ -313,7 +313,6 @@ impl OutputServer {
                                     loop{
                                         match server_socket_sender_receiver.recv().await{
                                             Some((bytes,address)) => {
-                                                print!("{},{}\n",bytes.len(),address);
                                                 let _= server_socket.send_to(bytes.as_slice(),address).await;
                                             }
                                             None => {}

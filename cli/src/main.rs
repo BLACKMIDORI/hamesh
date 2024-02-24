@@ -11,10 +11,9 @@ mod get_ip_version;
 
 use std::{io};
 use std::io::{Read};
-use std::sync::Arc;
 use std::net::{SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::{Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use regex::Regex;
 use bytes::Buf;
@@ -27,6 +26,7 @@ use h3_quinn::quinn;
 use http::Uri;
 use quinn::Endpoint;
 use simple_logger::SimpleLogger;
+use tokio::sync::Mutex;
 use tokio::time;
 use crate::tunnel::establish_connection;
 use crate::ip_version::IpVersion;
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Provide at least one --inbound or --outbound argument");
         return Ok(());
     }
-    info!("v0.1.0");
+    info!("v0.1.1");
     let ip_version_str = &args[2];
     let ip_version = match ip_version_str.as_str() {
         "ipv4" => { IpVersion::Ipv4 }
@@ -65,28 +65,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    let socket = &match ip_version {
-        IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
-        IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
-    }.unwrap();
-    let mut client_endpoint = match ip_version {
-        IpVersion::Ipv4 => { Endpoint::client("0.0.0.0:0".parse().unwrap())? }
-        IpVersion::Ipv6 => { Endpoint::client("[::]:0".parse().unwrap())? }
-    };
-    client_endpoint.rebind(socket.try_clone().unwrap()).expect("Could not rebind the QUIC connection to a existing UDP Socket");
+    let address;
+    let peers: Arc<Mutex<Option<(SubscriptionPeer, SubscriptionPeer)>>> = Arc::new(Mutex::new(None));
+    {
+        // Scoped socket in order to unbind it after receiving peer information
+        let socket = match ip_version {
+            IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
+            IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
+        }.unwrap();
+        let mut client_endpoint = match ip_version {
+            IpVersion::Ipv4 => { Endpoint::client("0.0.0.0:0".parse().unwrap())? }
+            IpVersion::Ipv6 => { Endpoint::client("[::]:0".parse().unwrap())? }
+        };
+        address = socket.local_addr().unwrap().clone();
+        client_endpoint.rebind(socket).expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
-    let subscription_result = subscribe_to_stun(socket).await;
-    let input_result = tokio::spawn(read_peer_subscription());
-    let subscription_id = subscription_result?;
-    let already_connected = std::sync::atomic::AtomicBool::new(false);
-    let mut client_clone = client_endpoint.clone();
-    tokio::join!(
+        let subscription_result = subscribe_to_stun(&mut client_endpoint).await;
+        let input_result = tokio::spawn(read_peer_subscription());
+        let subscription_id = subscription_result?;
+        let mut client_clone = client_endpoint.clone();
+        tokio::join!(
          async{
             let result = async {
                   let mut interval = time::interval(Duration::from_secs(1));
             interval.tick().await;
         loop {
-                    if already_connected.load(Ordering::Relaxed){
+                    if peers.lock().await.is_some(){
                         return Ok::<bool, ()>(false);
                     }
             let subscription_view_response_str_result = http3get(&mut client_clone, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await;
@@ -99,8 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else if subscription_response.value.peers.len() == 2 {
                         let peer_a = &subscription_response.value.peers[0];
                         let peer_b = &subscription_response.value.peers[1];
-                        already_connected.store(true, Ordering::Relaxed);
-                        tokio::join!(connect_peers(socket,peer_a.clone(), peer_b.clone()));
+                                let mut mutex = peers.lock().await;
+                            mutex.replace(((*peer_a).clone(),(*peer_b).clone()));
                         return Ok(true);
                     }
                 }
@@ -121,12 +125,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
          },
         async{
-            let subscription_id = input_result.await.unwrap().unwrap();
-
-            if  already_connected.load(Ordering::Relaxed) {
-                warn!("already connected!")
-            } else {
-                already_connected.store(true, Ordering::Relaxed);
+            let mut interval = time::interval(Duration::from_millis(100));
+            let mut canceled = true;
+            loop{
+                interval.tick().await;
+                if peers.lock().await.is_some(){
+                    break;
+                }
+                if input_result.is_finished(){
+                    if peers.lock().await.is_some(){
+                        warn!("already connected!")
+                    } else {
+                        canceled = false;
+                        break;
+                    }
+                }
+            }
+            if !canceled{
+                let subscription_id = input_result.await.unwrap().unwrap();
                 http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}").as_str()).await.unwrap();
                 let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await.unwrap();
 
@@ -137,12 +153,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     let peer_a = &subscription_response.value.peers[0];
                     let peer_b = &subscription_response.value.peers[1];
-                    tokio::join!(connect_peers(socket, peer_b,peer_a));
+                    let mut mutex = peers.lock().await;
+                    mutex.replace(((*peer_b).clone(),(*peer_a).clone()));
                 }
             }
         }
     );
-
+    }
+    match peers.lock().await.take() {
+        Some(peers) => {
+            // socket.
+            let new_socket = std::net::UdpSocket::bind(address).unwrap();
+            connect_peers(&new_socket, &peers.0, &peers.1).await
+        }
+        None => {
+            info!("No peers to connect")
+        }
+    }
     Ok(())
 }
 

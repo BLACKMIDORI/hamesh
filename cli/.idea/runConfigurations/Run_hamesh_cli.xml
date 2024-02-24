@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Run hamesh_cli" type="CargoCommandRunConfiguration" factoryName="Cargo Command" singleton="false">
-    <option name="command" value="run --package hamesh_cli --bin hamesh_cli -- p2p ipv6 --inbound 9876:6789/udp --outbound 6789:9876/udp " />
+    <option name="command" value="run --package hamesh_cli --bin hamesh_cli -- p2p ipv6 --inbound 9876:30000/udp --outbound 30000:9876/udp " />
     <option name="workingDirectory" value="file://$PROJECT_DIR$" />
     <envs />
     <option name="emulateTerminal" value="true" />
