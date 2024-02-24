@@ -65,20 +65,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    let address;
+    let socket = match ip_version {
+        IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
+        IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
+    }.unwrap();
     let peers: Arc<Mutex<Option<(SubscriptionPeer, SubscriptionPeer)>>> = Arc::new(Mutex::new(None));
     {
-        // Scoped socket in order to unbind it after receiving peer information
-        let socket = match ip_version {
-            IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
-            IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
-        }.unwrap();
+        // Scoped things to be cleaned after getting peers information
         let mut client_endpoint = match ip_version {
             IpVersion::Ipv4 => { Endpoint::client("0.0.0.0:0".parse().unwrap())? }
             IpVersion::Ipv6 => { Endpoint::client("[::]:0".parse().unwrap())? }
         };
-        address = socket.local_addr().unwrap().clone();
-        client_endpoint.rebind(socket).expect("Could not rebind the QUIC connection to a existing UDP Socket");
+        client_endpoint.rebind(socket.try_clone().unwrap()).expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
         let subscription_result = subscribe_to_stun(&mut client_endpoint).await;
         let input_result = tokio::spawn(read_peer_subscription());
@@ -162,9 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     match peers.lock().await.take() {
         Some(peers) => {
-            // socket.
-            let new_socket = std::net::UdpSocket::bind(address).unwrap();
-            connect_peers(&new_socket, &peers.0, &peers.1).await
+            connect_peers(&socket, &peers.0, &peers.1).await
         }
         None => {
             info!("No peers to connect")
