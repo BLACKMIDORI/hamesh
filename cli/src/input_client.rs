@@ -1,17 +1,17 @@
+use crate::control_datagram::ControlDatagram;
+use crate::get_ip_version::get_ip_version;
+use crate::ip_version::IpVersion;
+use crate::settings_models::{ClientDataSettings, PortSettings, Protocol, ServerDataSettings};
+use log::{error, info, warn};
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::time::Duration;
-use log::{error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Mutex;
 use tokio::time;
-use crate::control_datagram::ControlDatagram;
-use crate::get_ip_version::get_ip_version;
-use crate::ip_version::IpVersion;
-use crate::settings_models::{ClientDataSettings, PortSettings, Protocol, ServerDataSettings};
 
 #[derive(Clone, Debug)]
 pub struct InputClient {
@@ -20,21 +20,35 @@ pub struct InputClient {
     pub is_closed: Arc<Mutex<bool>>,
 }
 
-
 impl InputClient {
-    pub fn new(settings: ClientDataSettings, from_outside_tx: Sender<ControlDatagram>) -> InputClient {
-        InputClient { settings, from_outside_tx, is_closed: Arc::new(Mutex::new(false)) }
+    pub fn new(
+        settings: ClientDataSettings,
+        from_outside_tx: Sender<ControlDatagram>,
+    ) -> InputClient {
+        InputClient {
+            settings,
+            from_outside_tx,
+            is_closed: Arc::new(Mutex::new(false)),
+        }
     }
     pub async fn start(self, input_settings: PortSettings, tunnel_sender: Sender<ControlDatagram>) {
         let server_port = input_settings.host_port;
         let address;
         match get_ip_version().unwrap() {
             IpVersion::Ipv4 => {
-                address = SocketAddr::V4(format!("127.0.0.1:{server_port}").parse::<SocketAddrV4>().unwrap());
+                address = SocketAddr::V4(
+                    format!("127.0.0.1:{server_port}")
+                        .parse::<SocketAddrV4>()
+                        .unwrap(),
+                );
                 // tcp_listener_result = tokio::net::TcpListener::bind(address).await;
             }
             IpVersion::Ipv6 => {
-                address = SocketAddr::V6(format!("[::1]:{server_port}").parse::<SocketAddrV6>().unwrap());
+                address = SocketAddr::V6(
+                    format!("[::1]:{server_port}")
+                        .parse::<SocketAddrV6>()
+                        .unwrap(),
+                );
                 // tcp_listener_result = tokio::net::TcpListener::bind(address).await;
             }
         }
@@ -49,12 +63,17 @@ impl InputClient {
                         let (ack_sender, _) = tokio::sync::broadcast::channel(1024);
                         let (mut read_stream, mut write_stream) = stream.into_split();
                         let mut receiver = self.from_outside_tx.subscribe();
-                        tokio::spawn(self.clone().handle_retry(tunnel_sender.clone(), pre_tunnel_sender.clone(), ack_sender.clone()));
+                        tokio::spawn(self.clone().handle_retry(
+                            tunnel_sender.clone(),
+                            pre_tunnel_sender.clone(),
+                            ack_sender.clone(),
+                        ));
                         let reader_handler = tokio::spawn(async move {
                             let mut sequence: u64 = 0;
                             let mut received_zero_bytes = false;
                             loop {
-                                let id = format!("tcp_server_{server_port}_{client_port}_{sequence}");
+                                let id =
+                                    format!("tcp_server_{server_port}_{client_port}_{sequence}");
                                 let mut buff = Vec::with_capacity(65535);
                                 match read_stream.read_buf(&mut buff).await {
                                     Ok(size) => {
@@ -74,20 +93,28 @@ impl InputClient {
                                             ServerDataSettings {
                                                 protocol: Protocol::Tcp,
                                                 remote_host_port: self.settings.host_port,
-                                                remote_host_client_port: self.settings.host_client_port,
+                                                remote_host_client_port: self
+                                                    .settings
+                                                    .host_client_port,
                                             },
                                             encoded_data.as_str(),
                                         );
                                         match pre_tunnel_sender.send(datagram.clone()) {
                                             Ok(_) => {}
                                             Err(error) => {
-                                                error!("could not send local client data: {}", error);
+                                                error!(
+                                                    "could not send local client data: {}",
+                                                    error
+                                                );
                                             }
                                         }
                                         sequence += 1;
                                     }
                                     Err(error) => {
-                                        error!("could not read local server data({address}): {}", error);
+                                        error!(
+                                            "could not read local server data({address}): {}",
+                                            error
+                                        );
                                         break;
                                     }
                                 }
@@ -97,16 +124,18 @@ impl InputClient {
                         tokio::spawn(async move {
                             let _ = reader_handler.await;
                             // Gracefully free the write thread and close it
-                            support_sender.send(ControlDatagram::client_data(
-                                "close",
-                                0,
-                                ClientDataSettings {
-                                    protocol: Protocol::Tcp,
-                                    host_port: 0,
-                                    host_client_port: 0,
-                                },
-                                "",
-                            )).expect("failed to signal the writer to close");
+                            support_sender
+                                .send(ControlDatagram::client_data(
+                                    "close",
+                                    0,
+                                    ClientDataSettings {
+                                        protocol: Protocol::Tcp,
+                                        host_port: 0,
+                                        host_client_port: 0,
+                                    },
+                                    "",
+                                ))
+                                .expect("failed to signal the writer to close");
                         });
                         tokio::spawn(async move {
                             let mut sequence = 0;
@@ -115,7 +144,11 @@ impl InputClient {
                                     Ok(datagram) => {
                                         match datagram.r#type.as_str() {
                                             "client_data" => {
-                                                let sequence_str = datagram.content.get("sequence").cloned().unwrap_or("-1".to_string());
+                                                let sequence_str = datagram
+                                                    .content
+                                                    .get("sequence")
+                                                    .cloned()
+                                                    .unwrap_or("-1".to_string());
                                                 match sequence_str.parse::<u64>() {
                                                     Ok(received_sequence) => {
                                                         if received_sequence > sequence {
@@ -124,11 +157,19 @@ impl InputClient {
                                                             warn!("sequence out of order. discarded. expected: {sequence} received: {received_sequence}")
                                                         } else {
                                                             // if received_sequence <= sequence
-                                                            let id_option = datagram.content.get("id");
+                                                            let id_option =
+                                                                datagram.content.get("id");
                                                             match id_option {
                                                                 Some(id) => {
-                                                                    info!("🔻 RECEIVED {}{{id:{}}}", datagram.r#type,id);
-                                                                    match tunnel_sender.send(ControlDatagram::ack(id)) {
+                                                                    info!(
+                                                                        "🔻 RECEIVED {}{{id:{}}}",
+                                                                        datagram.r#type, id
+                                                                    );
+                                                                    match tunnel_sender.send(
+                                                                        ControlDatagram::ack_old(
+                                                                            id,
+                                                                        ),
+                                                                    ) {
                                                                         Ok(_) => {}
                                                                         Err(error) => {
                                                                             error!("failed to send the ACK of {}{{id:{}}}: {}",datagram.r#type,id,error)
@@ -142,17 +183,25 @@ impl InputClient {
 
                                                             if received_sequence == sequence {
                                                                 sequence += 1;
-                                                                let data_base64 = datagram.content["base64"].as_str();
-                                                                let data_result = base64::decode(data_base64);
+                                                                let data_base64 = datagram.content
+                                                                    ["base64"]
+                                                                    .as_str();
+                                                                let data_result =
+                                                                    base64::decode(data_base64);
                                                                 match data_result {
                                                                     Ok(data) => {
                                                                         if data.is_empty() {
-                                                                            let id = datagram.content["id"].as_str();
+                                                                            let id = datagram
+                                                                                .content["id"]
+                                                                                .as_str();
                                                                             if id == "close" {
                                                                                 break;
                                                                             }
                                                                         }
-                                                                        match write_stream.write(&data).await {
+                                                                        match write_stream
+                                                                            .write(&data)
+                                                                            .await
+                                                                        {
                                                                             Ok(_) => {}
                                                                             Err(error) => {
                                                                                 error!("could not receive the data for local server on its client: {error}")
@@ -171,23 +220,23 @@ impl InputClient {
                                                     }
                                                 }
                                             }
-                                            "ACK" => {
-                                                match ack_sender.send(datagram) {
-                                                    Ok(_) => {}
-                                                    Err(error) => {
-                                                        error!("error to handle ACK: {error}");
-                                                    }
+                                            "ACK" => match ack_sender.send(datagram) {
+                                                Ok(_) => {}
+                                                Err(error) => {
+                                                    error!("error to handle ACK: {error}");
                                                 }
-                                            }
+                                            },
                                             _ => {}
                                         }
                                     }
                                     Err(error) => {
-                                        error!("could not receive data from clients channel: {error}");
+                                        error!(
+                                            "could not receive data from clients channel: {error}"
+                                        );
                                     }
                                 }
                             }
-                            info!("closed {}/tcp",client_address );
+                            info!("closed {}/tcp", client_address);
                             let mut is_close_mutex = self.is_closed.lock().await;
                             *is_close_mutex = true;
                         });
@@ -201,7 +250,8 @@ impl InputClient {
                 let client_address;
                 match get_ip_version().unwrap() {
                     IpVersion::Ipv4 => {
-                        client_address = SocketAddr::V4("0.0.0.0:0".parse::<SocketAddrV4>().unwrap());
+                        client_address =
+                            SocketAddr::V4("0.0.0.0:0".parse::<SocketAddrV4>().unwrap());
                         // tcp_listener_result = tokio::net::TcpListener::bind(address).await;
                     }
                     IpVersion::Ipv6 => {
@@ -218,40 +268,48 @@ impl InputClient {
                                 let client_port = client_address.port();
                                 let mut receiver = self.from_outside_tx.subscribe();
 
-                                let (client_socket_sender, mut client_socket_sender_receiver) = channel::<Vec<u8>>(1024);
-                                let (client_socket_receiver_sender, mut client_socket_receiver) = channel::<(Vec<u8>, usize)>(1024);
+                                let (client_socket_sender, mut client_socket_sender_receiver) =
+                                    channel::<Vec<u8>>(1024);
+                                let (client_socket_receiver_sender, mut client_socket_receiver) =
+                                    channel::<(Vec<u8>, usize)>(1024);
                                 tokio::spawn(async move {
                                     tokio::join!(
-                                async{
-                                    loop{
-                                        let mut buff = Vec::with_capacity(65535);
-                                        match client_socket.recv_buf(&mut buff).await{
-                                            Ok(size) => {
-                                                let _=client_socket_receiver_sender.send((buff,size)).await;
+                                        async {
+                                            loop {
+                                                let mut buff = Vec::with_capacity(65535);
+                                                match client_socket.recv_buf(&mut buff).await {
+                                                    Ok(size) => {
+                                                        let _ = client_socket_receiver_sender
+                                                            .send((buff, size))
+                                                            .await;
+                                                    }
+                                                    Err(_) => {}
+                                                }
                                             }
-                                            Err(_) => {}
-                                        }
-                                    }
-                                },
-                                async{
-                                    loop{
-                                        match client_socket_sender_receiver.recv().await{
-                                            Some(bytes) => {
-                                                let _= client_socket.send(bytes.as_slice()).await;
+                                        },
+                                        async {
+                                            loop {
+                                                match client_socket_sender_receiver.recv().await {
+                                                    Some(bytes) => {
+                                                        let _ = client_socket
+                                                            .send(bytes.as_slice())
+                                                            .await;
+                                                    }
+                                                    None => {}
+                                                }
                                             }
-                                            None => {}
                                         }
-                                    }
-                                }
-                            )
+                                    )
                                 });
                                 let reader_handler = tokio::spawn(async move {
                                     let mut sequence: u64 = 0;
                                     let mut received_zero_bytes = false;
                                     loop {
-                                        let id = format!("udp_server_{server_port}_{client_port}_{sequence}");
+                                        let id = format!(
+                                            "udp_server_{server_port}_{client_port}_{sequence}"
+                                        );
                                         match client_socket_receiver.recv().await {
-                                            Some((buff,size)) => {
+                                            Some((buff, size)) => {
                                                 if size == 0 {
                                                     if !received_zero_bytes {
                                                         received_zero_bytes = true;
@@ -268,14 +326,19 @@ impl InputClient {
                                                     ServerDataSettings {
                                                         protocol: Protocol::Udp,
                                                         remote_host_port: self.settings.host_port,
-                                                        remote_host_client_port: self.settings.host_client_port,
+                                                        remote_host_client_port: self
+                                                            .settings
+                                                            .host_client_port,
                                                     },
                                                     encoded_data.as_str(),
                                                 );
                                                 match tunnel_sender.send(datagram.clone()) {
                                                     Ok(_) => {}
                                                     Err(error) => {
-                                                        error!("could not send local client data: {}", error);
+                                                        error!(
+                                                            "could not send local client data: {}",
+                                                            error
+                                                        );
                                                     }
                                                 }
                                                 sequence += 1;
@@ -291,63 +354,74 @@ impl InputClient {
                                 tokio::spawn(async move {
                                     let _ = reader_handler.await;
                                     // Gracefully free the write thread and close it
-                                    support_sender.send(ControlDatagram::client_data(
-                                        "close",
-                                        0,
-                                        ClientDataSettings {
-                                            protocol: Protocol::Udp,
-                                            host_port: 0,
-                                            host_client_port: 0,
-                                        },
-                                        "",
-                                    )).expect("failed to signal the writer to close");
+                                    support_sender
+                                        .send(ControlDatagram::client_data(
+                                            "close",
+                                            0,
+                                            ClientDataSettings {
+                                                protocol: Protocol::Udp,
+                                                host_port: 0,
+                                                host_client_port: 0,
+                                            },
+                                            "",
+                                        ))
+                                        .expect("failed to signal the writer to close");
                                 });
                                 tokio::spawn(async move {
                                     loop {
                                         match receiver.recv().await {
-                                            Ok(datagram) => {
-                                                match datagram.r#type.as_str() {
-                                                    "client_data" => {
-                                                        let id_option = datagram.content.get("id");
-                                                        match id_option {
-                                                            Some(id) => {
-                                                                info!("🔻 RECEIVED {}{{id:{}}}", datagram.r#type,id);
-                                                            }
-                                                            None => {
-                                                                warn!("🔻 RECEIVED {} without id", datagram.r#type);
-                                                            }
+                                            Ok(datagram) => match datagram.r#type.as_str() {
+                                                "client_data" => {
+                                                    let id_option = datagram.content.get("id");
+                                                    match id_option {
+                                                        Some(id) => {
+                                                            info!(
+                                                                "🔻 RECEIVED {}{{id:{}}}",
+                                                                datagram.r#type, id
+                                                            );
                                                         }
-                                                        let data_base64 = datagram.content["base64"].as_str();
-                                                        let data_result = base64::decode(data_base64);
-                                                        match data_result {
-                                                            Ok(data) => {
-                                                                if data.is_empty() {
-                                                                    let id = datagram.content["id"].as_str();
-                                                                    if id == "close" {
-                                                                        break;
-                                                                    }
-                                                                }
-                                                                match client_socket_sender.send(data).await {
-                                                                    Ok(_) => {}
-                                                                    Err(error) => {
-                                                                        error!("could not receive the data for local server on its client: {error}")
-                                                                    }
-                                                                }
-                                                            }
-                                                            Err(error) => {
-                                                                error!("could not decode remote client data: {error}")
-                                                            }
+                                                        None => {
+                                                            warn!(
+                                                                "🔻 RECEIVED {} without id",
+                                                                datagram.r#type
+                                                            );
                                                         }
                                                     }
-                                                    _ => {}
+                                                    let data_base64 =
+                                                        datagram.content["base64"].as_str();
+                                                    let data_result = base64::decode(data_base64);
+                                                    match data_result {
+                                                        Ok(data) => {
+                                                            if data.is_empty() {
+                                                                let id =
+                                                                    datagram.content["id"].as_str();
+                                                                if id == "close" {
+                                                                    break;
+                                                                }
+                                                            }
+                                                            match client_socket_sender
+                                                                .send(data)
+                                                                .await
+                                                            {
+                                                                Ok(_) => {}
+                                                                Err(error) => {
+                                                                    error!("could not receive the data for local server on its client: {error}")
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            error!("could not decode remote client data: {error}")
+                                                        }
+                                                    }
                                                 }
-                                            }
+                                                _ => {}
+                                            },
                                             Err(error) => {
                                                 error!("could not receive data from clients channel: {error}");
                                             }
                                         }
                                     }
-                                    info!("closed {}/tcp",client_address );
+                                    info!("closed {}/tcp", client_address);
                                     let mut is_close_mutex = self.is_closed.lock().await;
                                     *is_close_mutex = true;
                                 });
@@ -358,16 +432,20 @@ impl InputClient {
                         }
                     }
                     Err(error) => {
-                        error!("could not start a udp client socket: {}",error)
+                        error!("could not start a udp client socket: {}", error)
                     }
                 }
             }
         }
     }
 
-
     // TODO: improve memory usage
-    async fn handle_retry(self, tunnel_sender: Sender<ControlDatagram>, pre_tunnel_sender: Sender<ControlDatagram>, ack_sender: Sender<ControlDatagram>) {
+    async fn handle_retry(
+        self,
+        tunnel_sender: Sender<ControlDatagram>,
+        pre_tunnel_sender: Sender<ControlDatagram>,
+        ack_sender: Sender<ControlDatagram>,
+    ) {
         let mut pre_tunnel_receiver = pre_tunnel_sender.subscribe();
         loop {
             match pre_tunnel_receiver.recv().await {
@@ -383,20 +461,19 @@ impl InputClient {
                             let ack_handler = tokio::spawn(async move {
                                 loop {
                                     match ack_receiver.recv().await {
-                                        Ok(datagram) => {
-                                            match datagram.r#type.as_str() {
-                                                "ACK" => {
-                                                    let id = datagram.content["id"].clone();
-                                                    if id == datagram_id {
-                                                        let mut received_ack_mutex = received_ack1.lock().await;
-                                                        *received_ack_mutex = true;
-                                                    }
-                                                }
-                                                _ => {
-                                                    error!("datagram is not ACK: {}", datagram.r#type);
+                                        Ok(datagram) => match datagram.r#type.as_str() {
+                                            "ACK" => {
+                                                let id = datagram.content["id"].clone();
+                                                if id == datagram_id {
+                                                    let mut received_ack_mutex =
+                                                        received_ack1.lock().await;
+                                                    *received_ack_mutex = true;
                                                 }
                                             }
-                                        }
+                                            _ => {
+                                                error!("datagram is not ACK: {}", datagram.r#type);
+                                            }
+                                        },
                                         Err(error) => {
                                             error!("[recv]could not receive ACK for retry handling: {}", error);
                                         }
@@ -430,7 +507,10 @@ impl InputClient {
                     }
                 }
                 Err(error) => {
-                    error!("[recv]could not send local client data to tunnel: {}", error);
+                    error!(
+                        "[recv]could not send local client data to tunnel: {}",
+                        error
+                    );
                 }
             }
         }

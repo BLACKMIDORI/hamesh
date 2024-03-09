@@ -1,2 +1,4 @@
-
-pub enum IpVersion { Ipv4, Ipv6 }
+pub enum IpVersion {
+    Ipv4,
+    Ipv6,
+}

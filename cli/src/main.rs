@@ -1,37 +1,40 @@
+mod control_datagram;
+mod get_ip_version;
+mod inbound_client;
+mod input_client;
+mod ip_version;
+mod outbound_server;
+mod output_server;
+mod settings_models;
+mod stun_client;
 mod subscription_response;
 mod subscription_view_response;
-mod control_datagram;
 mod tunnel;
-mod stun_client;
-mod settings_models;
-mod ip_version;
-mod output_server;
-mod input_client;
-mod get_ip_version;
+mod tunnel_old;
 
-use std::{io};
-use std::io::{Read};
-use std::net::{SocketAddr};
+use bytes::Buf;
+use regex::Regex;
+use std::error::Error;
+use std::io;
+use std::io::Read;
+use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use regex::Regex;
-use bytes::Buf;
 
-use futures::{future};
-// use structopt::StructOpt;
-use log::{error, info, LevelFilter, warn};
+use futures::future;
+use log::{error, info, warn, LevelFilter};
 
+use crate::ip_version::IpVersion;
+use crate::stun_client::subscribe_to_stun;
+use crate::subscription_view_response::SubscriptionPeer;
+use crate::tunnel::Tunnel;
 use h3_quinn::quinn;
 use http::Uri;
 use quinn::Endpoint;
 use simple_logger::SimpleLogger;
 use tokio::sync::Mutex;
 use tokio::time;
-use crate::tunnel::establish_connection;
-use crate::ip_version::IpVersion;
-use crate::stun_client::subscribe_to_stun;
-use crate::subscription_view_response::SubscriptionPeer;
 
 static ALPN: &[u8] = b"h3";
 
@@ -39,14 +42,17 @@ static ALPN: &[u8] = b"h3";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new()
         .with_level(LevelFilter::Info)
-        .init().unwrap();
+        .init()
+        .unwrap();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         show_help_message();
         return Ok(());
     }
     let joined = format!("hamash {}", args[1..].join(" "));
-    let regex = Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:inbound|outbound) \d+:\d+/(?:tcp|udp))*$").unwrap();
+    let regex =
+        Regex::new(r"^hamash p2p (?:ipv4|ipv6)(?: --(?:inbound|outbound) \d+:\d+/(?:tcp|udp))*$")
+            .unwrap();
     if !regex.is_match(joined.as_str()) {
         show_help_message();
         return Ok(());
@@ -58,33 +64,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("v0.1.1");
     let ip_version_str = &args[2];
     let ip_version = match ip_version_str.as_str() {
-        "ipv4" => { IpVersion::Ipv4 }
-        "ipv6" => { IpVersion::Ipv6 }
+        "ipv4" => IpVersion::Ipv4,
+        "ipv6" => IpVersion::Ipv6,
         _ => {
-            error!("invalid ip version: {}",ip_version_str);
+            error!("invalid ip version: {}", ip_version_str);
             return Ok(());
         }
     };
     let socket = match ip_version {
-        IpVersion::Ipv4 => { std::net::UdpSocket::bind("0.0.0.0:0") }
-        IpVersion::Ipv6 => { std::net::UdpSocket::bind("[::]:0") }
-    }.unwrap();
-    let peers: Arc<Mutex<Option<(SubscriptionPeer, SubscriptionPeer)>>> = Arc::new(Mutex::new(None));
+        IpVersion::Ipv4 => std::net::UdpSocket::bind("0.0.0.0:0"),
+        IpVersion::Ipv6 => std::net::UdpSocket::bind("[::]:0"),
+    }
+    .unwrap();
+    let peers: Arc<Mutex<Option<(SubscriptionPeer, SubscriptionPeer)>>> =
+        Arc::new(Mutex::new(None));
     {
         // Scoped things to be cleaned after getting peers information
         let mut client_endpoint = match ip_version {
-            IpVersion::Ipv4 => { Endpoint::client("0.0.0.0:0".parse().unwrap())? }
-            IpVersion::Ipv6 => { Endpoint::client("[::]:0".parse().unwrap())? }
+            IpVersion::Ipv4 => Endpoint::client("0.0.0.0:0".parse().unwrap())?,
+            IpVersion::Ipv6 => Endpoint::client("[::]:0".parse().unwrap())?,
         };
-        client_endpoint.rebind(socket.try_clone().unwrap()).expect("Could not rebind the QUIC connection to a existing UDP Socket");
+        client_endpoint
+            .rebind(socket.try_clone().unwrap())
+            .expect("Could not rebind the QUIC connection to a existing UDP Socket");
 
         let subscription_result = subscribe_to_stun(&mut client_endpoint).await;
         let input_result = tokio::spawn(read_peer_subscription());
         let subscription_id = subscription_result?;
         let mut client_clone = client_endpoint.clone();
         tokio::join!(
-         async{
-            let result = async {
+            async {
+                let result = async {
                   let mut interval = time::interval(Duration::from_secs(1));
             interval.tick().await;
         loop {
@@ -115,56 +125,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("subscription expired!");
         return Ok(false);
             }.await;
-            match result{
-                Ok(_)=>{ },
-                Err(..)=>{
-                    error!("failed waiting peers to connect.")
+                match result {
+                    Ok(_) => {}
+                    Err(..) => {
+                        error!("failed waiting peers to connect.")
+                    }
                 }
-            }
-         },
-        async{
-            let mut interval = time::interval(Duration::from_millis(100));
-            let mut canceled = true;
-            loop{
-                interval.tick().await;
-                if peers.lock().await.is_some(){
-                    break;
-                }
-                if input_result.is_finished(){
-                    if peers.lock().await.is_some(){
-                        warn!("already connected!")
-                    } else {
-                        canceled = false;
+            },
+            async {
+                let mut interval = time::interval(Duration::from_millis(100));
+                let mut canceled = true;
+                loop {
+                    interval.tick().await;
+                    if peers.lock().await.is_some() {
                         break;
+                    }
+                    if input_result.is_finished() {
+                        if peers.lock().await.is_some() {
+                            warn!("already connected!")
+                        } else {
+                            canceled = false;
+                            break;
+                        }
+                    }
+                }
+                if !canceled {
+                    let subscription_id = input_result.await.unwrap().unwrap();
+                    http3get(
+                        &mut client_endpoint,
+                        format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}")
+                            .as_str(),
+                    )
+                    .await
+                    .unwrap();
+                    let subscription_view_response_str = http3get(
+                        &mut client_endpoint,
+                        format!(
+                            "https://hamesh-stun.blackmidori.com/subscription/{subscription_id}"
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .unwrap();
+
+                    let subscription_response = serde_json::from_str::<
+                        subscription_view_response::SubscriptionViewResponse,
+                    >(
+                        &subscription_view_response_str
+                    )
+                    .unwrap();
+
+                    if subscription_response.value.peers.len() < 2 {
+                        error!("after we joined, we didn't find 2 peers in this subscription. It may be expired.")
+                    } else {
+                        let peer_a = &subscription_response.value.peers[0];
+                        let peer_b = &subscription_response.value.peers[1];
+                        let mut mutex = peers.lock().await;
+                        mutex.replace(((*peer_b).clone(), (*peer_a).clone()));
                     }
                 }
             }
-            if !canceled{
-                let subscription_id = input_result.await.unwrap().unwrap();
-                http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/join/{subscription_id}").as_str()).await.unwrap();
-                let subscription_view_response_str = http3get(&mut client_endpoint, format!("https://hamesh-stun.blackmidori.com/subscription/{subscription_id}").as_str()).await.unwrap();
-
-                let subscription_response = serde_json::from_str::<subscription_view_response::SubscriptionViewResponse>(&subscription_view_response_str).unwrap();
-
-                if subscription_response.value.peers.len() < 2 {
-                    error!("after we joined, we didn't find 2 peers in this subscription. It may be expired.")
-                } else {
-                    let peer_a = &subscription_response.value.peers[0];
-                    let peer_b = &subscription_response.value.peers[1];
-                    let mut mutex = peers.lock().await;
-                    mutex.replace(((*peer_b).clone(),(*peer_a).clone()));
-                }
-            }
-        }
-    );
+        );
     }
     match peers.lock().await.take() {
-        Some(peers) => {
-            connect_peers(&socket, &peers.0, &peers.1).await
-        }
-        None => {
-            info!("No peers to connect")
-        }
+        Some(peers) => connect_peers(socket, &peers.0, &peers.1).await?,
+        None => info!("No peers to connect"),
     }
     Ok(())
 }
@@ -178,30 +203,44 @@ Client Example: hamesh p2p ipv6 --outbound 1234:25565/tcp\
 ")
 }
 
-async fn connect_peers(socket: &std::net::UdpSocket, source_peer: &SubscriptionPeer, dest_peer: &SubscriptionPeer) {
+async fn connect_peers(
+    socket: std::net::UdpSocket,
+    source_peer: &SubscriptionPeer,
+    dest_peer: &SubscriptionPeer,
+) -> Result<(), Box<dyn Error>> {
     let source_address;
     let dest_address;
     if source_peer.address.contains(".") {
-        source_address = SocketAddr::from_str(format!("{}:{}", source_peer.address, source_peer.port).as_str()).unwrap()
+        source_address =
+            SocketAddr::from_str(format!("{}:{}", source_peer.address, source_peer.port).as_str())
+                .unwrap()
     } else {
-        source_address = SocketAddr::from_str(format!("[{}]:{}", source_peer.address, source_peer.port).as_str()).unwrap()
+        source_address =
+            SocketAddr::from_str(format!("[{}]:{}", source_peer.address, source_peer.port).as_str())
+                .unwrap()
     }
     if dest_peer.address.contains(".") {
-        dest_address = SocketAddr::from_str(format!("{}:{}", dest_peer.address, dest_peer.port).as_str()).unwrap()
+        dest_address =
+            SocketAddr::from_str(format!("{}:{}", dest_peer.address, dest_peer.port).as_str())
+                .unwrap()
     } else {
-        dest_address = SocketAddr::from_str(format!("[{}]:{}", dest_peer.address, dest_peer.port).as_str()).unwrap()
+        dest_address =
+            SocketAddr::from_str(format!("[{}]:{}", dest_peer.address, dest_peer.port).as_str())
+                .unwrap()
     }
-    establish_connection(socket.try_clone().unwrap(), source_address, dest_address).await;
+    let tunnel = Tunnel::new(socket, source_address, dest_address);
+    tunnel.start().await
 }
-
 
 async fn read_peer_subscription() -> Result<String, io::Error> {
     info!("enter a peer subscription id:");
     Ok(io::stdin().lines().next().unwrap().unwrap())
 }
 
-
-async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, Box<dyn std::error::Error>> {
+async fn http3get(
+    client_endpoint: &mut Endpoint,
+    url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     // DNS lookup
     let uri = url.parse::<http::Uri>()?;
 
@@ -216,36 +255,31 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
     let args: Vec<String> = std::env::args().collect();
     let ip_version_str = &args[2];
     let ip_version = match ip_version_str.as_str() {
-        "ipv4" => { IpVersion::Ipv4 }
-        "ipv6" => { IpVersion::Ipv6 }
+        "ipv4" => IpVersion::Ipv4,
+        "ipv6" => IpVersion::Ipv6,
         _ => {
-            error!("invalid ip version: {}",ip_version_str);
+            error!("invalid ip version: {}", ip_version_str);
             IpVersion::Ipv6
         }
     };
-    let addresses = tokio::net::lookup_host((auth.host(), port))
-        .await?;
+    let addresses = tokio::net::lookup_host((auth.host(), port)).await?;
     let mut address_option = None;
     for socket_address in addresses {
         match socket_address {
-            SocketAddr::V4(_) => {
-                match ip_version {
-                    IpVersion::Ipv4 => {
-                        address_option = Some(socket_address);
-                        break;
-                    }
-                    _ => {}
+            SocketAddr::V4(_) => match ip_version {
+                IpVersion::Ipv4 => {
+                    address_option = Some(socket_address);
+                    break;
                 }
-            }
-            SocketAddr::V6(_) => {
-                match ip_version {
-                    IpVersion::Ipv6 => {
-                        address_option = Some(socket_address);
-                        break;
-                    }
-                    _ => {}
+                _ => {}
+            },
+            SocketAddr::V6(_) => match ip_version {
+                IpVersion::Ipv6 => {
+                    address_option = Some(socket_address);
+                    break;
                 }
-            }
+                _ => {}
+            },
         }
     }
     let address = address_option.ok_or("dns found no addresses")?;
@@ -279,7 +313,6 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
     tls_config.enable_early_data = true;
     tls_config.alpn_protocols = vec![ALPN.into()];
 
-
     let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
     client_endpoint.set_default_client_config(client_config);
 
@@ -291,7 +324,11 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, B
     body
 }
 
-async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> Result<String, Box<dyn std::error::Error>> {
+async fn run_client(
+    client_endpoint: &Endpoint,
+    addr: SocketAddr,
+    uri: Uri,
+) -> Result<String, Box<dyn std::error::Error>> {
     let auth = uri.authority().ok_or("uri must have a host")?.clone();
 
     let conn = client_endpoint.connect(addr, auth.host())?.await?;
@@ -321,7 +358,10 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
     let request = async move {
         // info!("sending request ...");
 
-        let req = http::Request::builder().uri(uri).header("Accept-Version", "1").body(())?;
+        let req = http::Request::builder()
+            .uri(uri)
+            .header("Accept-Version", "1")
+            .body(())?;
 
         // sending request results in a bidirectional stream,
         // which is also used for receiving response
@@ -350,8 +390,9 @@ async fn run_client(client_endpoint: &Endpoint, addr: SocketAddr, uri: Uri) -> R
             }
         }
 
-        let body = std::str::from_utf8(&buffer[..buffer_size]).unwrap().to_string();
-
+        let body = std::str::from_utf8(&buffer[..buffer_size])
+            .unwrap()
+            .to_string();
 
         let status = response.status();
         if !status.is_success() {
