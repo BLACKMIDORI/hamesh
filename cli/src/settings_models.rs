@@ -1,10 +1,24 @@
 use std::fmt::Formatter;
+use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, Hash)]
 pub enum Protocol {
     Tcp,
     Udp,
 }
+impl FromStr for Protocol {
+    type Err = String;
+
+    fn from_str(protocol: &str) -> Result<Self, Self::Err> {
+        match protocol {
+            "tcp" => Ok(Protocol::Tcp),
+            "udp" => Ok(Protocol::Udp),
+            _ => Err("Invalid protocol. Must be tcp or udp".to_string()),
+        }
+    }
+}
+
 impl PartialEq for Protocol {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -39,9 +53,17 @@ impl std::fmt::Display for PortSettings {
         write!(
             fmt,
             "{}:{}/{}",
-            self.host_port,
-            self.remote_host_port,
-            match self.protocol {
+            self.host_port, self.remote_host_port, self.protocol,
+        )
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            fmt,
+            "{}",
+            match self {
                 Protocol::Tcp => {
                     "tcp"
                 }

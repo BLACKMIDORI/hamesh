@@ -1,4 +1,7 @@
 use crate::control_datagram::ControlDatagram;
+use crate::fragment_handler::FragmentHandler;
+use crate::inbound_client::InboundClient;
+use crate::outbound_server::OutboundServer;
 use crate::settings_models::{PortSettings, Protocol};
 use log::{error, info, warn};
 use regex::Regex;
@@ -9,8 +12,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::available_parallelism;
-use std::time::Duration;
-use tokio::net::UdpSocket;
+use std::time::{Duration, Instant};
 
 pub struct Tunnel {
     socket: std::net::UdpSocket,
@@ -32,23 +34,51 @@ impl Tunnel {
     }
     pub async fn start(&self) -> Result<(), Box<dyn Error>> {
         let tokio_socket = self.connect().await?;
-        
+
         self.perform_handshake(&tokio_socket).await;
-        self.exchange_port_settings(&tokio_socket).await;
+        let outbound_matches = self.exchange_port_settings(&tokio_socket).await;
+        let mut last_outbound_match_handled = None;
 
         let default_parallelism_approx = available_parallelism().unwrap().get();
+        let outbound_server_per_thread =
+            outbound_matches.len().div_ceil(default_parallelism_approx);
+        let (tunnel_sender, tunnel_receiver) = tokio::sync::mpsc::channel::<ControlDatagram>(1024);
         let mut senders = Vec::with_capacity(default_parallelism_approx);
+        let mut servers = HashMap::new();
         let mut main_receiver = None;
         for i in 0..default_parallelism_approx {
             let (sender, receiver) = tokio::sync::mpsc::channel::<ControlDatagram>(1024);
+            let outbound_server_sender = sender.clone();
             senders.push(sender);
 
             if i == 0 {
                 main_receiver = Some(receiver);
-            }else{
-                tokio::spawn(async move{
+            } else {
+                let mut outbound_servers_port_settings = Vec::new();
+                for i_match in 0..outbound_server_per_thread {
+                    last_outbound_match_handled = Some(i * outbound_server_per_thread + i_match);
+                    match outbound_matches.get(last_outbound_match_handled.unwrap()) {
+                        None => {}
+                        Some(port_settings) => {
+                            let outbound_server = self.create_outbound_server(
+                                port_settings,
+                                outbound_server_sender.clone(),
+                            );
+                            let outbound_server_key = (
+                                outbound_server.remote_host_port,
+                                outbound_server.remote_protocol,
+                            );
+                            servers.insert(outbound_server_key, outbound_server);
+                            outbound_servers_port_settings.push(*port_settings)
+                        }
+                    }
+                }
+                tokio::spawn(async move {
                     let mut channel_receiver = receiver;
                     info!("hello, {:?}", std::thread::current().id());
+                    for port_settings in outbound_servers_port_settings {
+                        OutboundServer::start(port_settings).await;
+                    }
                     loop {
                         match channel_receiver.recv().await {
                             _ => {}
@@ -58,13 +88,32 @@ impl Tunnel {
             }
         }
 
+        let outbound_match_start_index = last_outbound_match_handled
+            .and_then(|i| Some(i + 1))
+            .unwrap_or(0);
+        let mut outbound_servers_port_settings = Vec::new();
+        for i in outbound_match_start_index..outbound_matches.len() {
+            let port_settings = &outbound_matches[i];
+            let outbound_server =
+                self.create_outbound_server(port_settings, senders.first().unwrap().clone());
+            let outbound_server_key = (
+                outbound_server.remote_host_port,
+                outbound_server.remote_protocol,
+            );
+            servers.insert(outbound_server_key, outbound_server);
+            outbound_servers_port_settings.push(*port_settings)
+        }
+
         tokio::join!(
             async {
-                Self::tunnel_handler(&tokio_socket).await;
+                Self::tunnel_handler(&tokio_socket, tunnel_receiver, &senders, servers).await;
             },
             async {
                 let mut receiver = main_receiver.unwrap();
                 info!("hello from main, {:?}", std::thread::current().id());
+                for port_settings in outbound_servers_port_settings {
+                    OutboundServer::start(port_settings).await;
+                }
                 loop {
                     match receiver.recv().await {
                         _ => {}
@@ -186,7 +235,10 @@ impl Tunnel {
         }
     }
 
-    async fn exchange_port_settings(&self, tokio_socket: &tokio::net::UdpSocket) {
+    async fn exchange_port_settings(
+        &self,
+        tokio_socket: &tokio::net::UdpSocket,
+    ) -> Vec<PortSettings> {
         let (inbound, outbound) = Self::get_settings();
         let current_index_atomic = AtomicUsize::new(0);
         let receiver_stopped_atomic = AtomicBool::new(false);
@@ -339,12 +391,15 @@ impl Tunnel {
             (Err(error1), Err(error2)) => {
                 error!("exchange_port_settings: {error1}");
                 error!("exchange_port_settings: {error2}");
+                Vec::new()
             }
             (Err(error), _) => {
                 error!("exchange_port_settings: {error}");
+                Vec::new()
             }
             (_, Err(error)) => {
                 error!("exchange_port_settings: {error}");
+                Vec::new()
             }
             (Ok(_), Ok(outbound_matches)) => {
                 for port_settings in outbound.iter() {
@@ -356,25 +411,44 @@ impl Tunnel {
                         warn!("UNMATCHED OUTBOUND: {}", port_settings);
                     }
                 }
-                info!("🚪<->🚪  port settings done")
+                info!("🚪<->🚪  port settings done");
+                outbound_matches
             }
         }
     }
-    async fn tunnel_handler(tokio_socket: &tokio::net::UdpSocket) {
+
+    fn create_outbound_server(
+        &self,
+        port_settings: &PortSettings,
+        threads_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
+    ) -> OutboundServer {
+        OutboundServer::new(
+            port_settings.host_port,
+            port_settings.remote_host_port,
+            port_settings.protocol,
+            threads_sender,
+        )
+    }
+    async fn tunnel_handler(
+        tokio_socket: &tokio::net::UdpSocket,
+        mut tunnel_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
+        threads_senders: &[tokio::sync::mpsc::Sender<ControlDatagram>],
+        outbound_servers: HashMap<(u16, Protocol), OutboundServer>,
+    ) {
+        let senders_length = threads_senders.len();
+        let mut next_thread_sender_index = (outbound_servers.len() + 1) % senders_length;
+        let mut inbound_clients = HashMap::new();
+        let fragment_handler = FragmentHandler::new();
         let (result1, result2) = tokio::join!(
             async {
-                let mut interval = tokio::time::interval(Duration::from_secs(10));
                 loop {
-                    Self::send_datagram(
-                        tokio_socket,
-                        &ControlDatagram {
-                            r#type: "heart_beat".to_string(),
-                            version: 1,
-                            content: HashMap::new(),
-                        },
-                    )
-                    .await?;
-                    interval.tick().await;
+                    match tunnel_receiver.recv().await {
+                        None => {
+                            warn!("tunnel closed");
+                            break;
+                        }
+                        Some(datagram) => Self::send_datagram(tokio_socket, &datagram).await?,
+                    }
                 }
                 Ok::<(), Box<dyn Error>>(())
             },
@@ -387,34 +461,116 @@ impl Tunnel {
                             let datagram_result = ControlDatagram::from(size, &buffer);
                             match datagram_result {
                                 Err(error) => error!("tunnel_handler: {error}"),
-                                Ok(datagram) => {
-                                    if datagram.version != 1 {
+                                Ok(received_datagram) => {
+                                    if received_datagram.version != 1 {
                                         error!(
                                             "🔻 RECEIVED {} with unrecognized version",
-                                            datagram.r#type
+                                            received_datagram.r#type
                                         );
                                         panic!("unrecognized version")
                                     }
                                     info!(
                                         "🔻 RECEIVED {}{}",
-                                        datagram.r#type,
-                                        datagram
+                                        received_datagram.r#type,
+                                        received_datagram
                                             .content
                                             .get("id")
                                             .and_then(|id| { Some(format!("{{id:{id}}}")) })
                                             .unwrap_or(String::from(""))
                                     );
-                                    if datagram.r#type != "ACK" {
+                                    if received_datagram.r#type != "ACK" {
                                         Self::send_datagram(
                                             tokio_socket,
-                                            &ControlDatagram::ack(&datagram),
+                                            &ControlDatagram::ack(&received_datagram),
                                         )
                                         .await?;
                                     }
+                                    let datagram = match received_datagram.r#type.as_str() {
+                                        "fragment" => {
+                                            match fragment_handler
+                                                .get_complete_datagram(received_datagram)
+                                            {
+                                                None => continue,
+                                                Some(data) => data,
+                                            }
+                                        }
+                                        _ => received_datagram,
+                                    };
                                     match datagram.r#type.as_str() {
-                                        "ACK" => {}
-                                        "datagram_type" => {}
-
+                                        "ACK" => (),
+                                        "client_data" => {
+                                            let future = async {
+                                                let remote_host_port: u16 =
+                                                    datagram.content["hostClientPort"].parse()?;
+                                                let remote_client_port: u16 =
+                                                    datagram.content["hostClientPort"].parse()?;
+                                                let remote_protocol: Protocol =
+                                                    datagram.content["protocol"].parse()?;
+                                                let key = (
+                                                    remote_host_port,
+                                                    remote_client_port,
+                                                    remote_protocol,
+                                                );
+                                                if !inbound_clients.contains_key(&key) {
+                                                    let sender = threads_senders
+                                                        [next_thread_sender_index]
+                                                        .clone();
+                                                    next_thread_sender_index =
+                                                        (next_thread_sender_index + 1)
+                                                            % senders_length;
+                                                    inbound_clients.insert(
+                                                        key,
+                                                        InboundClient::new(
+                                                            remote_host_port,
+                                                            remote_client_port,
+                                                            remote_protocol,
+                                                            sender,
+                                                        ),
+                                                    );
+                                                }
+                                                let inbound_client = &inbound_clients[&key];
+                                                inbound_client.last_download_activity.store(
+                                                    Instant::now().elapsed().as_secs(),
+                                                    Ordering::Relaxed,
+                                                );
+                                                inbound_client.sender.send(datagram).await?;
+                                                Ok::<(), Box<dyn Error>>(())
+                                            };
+                                            match future.await {
+                                                Err(error) => {
+                                                    error!("tunnel_handler(client_data): {error}");
+                                                }
+                                                _ => (),
+                                            }
+                                        }
+                                        "server_data" => {
+                                            let future = async {
+                                                let local_client_port: u16 = datagram.content
+                                                    ["remoteHostClientPort"]
+                                                    .parse()?;
+                                                let local_protocol: Protocol =
+                                                    datagram.content["protocol"].parse()?;
+                                                let key = (local_client_port, local_protocol);
+                                                match outbound_servers.get(&key) {
+                                                    None => {
+                                                        warn!("received a server_data for unknown outbound server: {local_client_port}/{local_protocol}")
+                                                    }
+                                                    Some(outbound_server) => {
+                                                        outbound_server
+                                                            .sender
+                                                            .send(datagram)
+                                                            .await?;
+                                                    }
+                                                }
+                                                Ok::<(), Box<dyn Error>>(())
+                                            };
+                                            match future.await {
+                                                Err(error) => {
+                                                    error!("tunnel_handler(server_data): {error}");
+                                                }
+                                                _ => (),
+                                            }
+                                        }
                                         "input_port" => {
                                             let remote_inbound_settings_result =
                                                 Self::parse_remote_inbound_settings(&datagram);
