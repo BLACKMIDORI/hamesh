@@ -27,6 +27,7 @@ use std::time::Duration;
 use futures::future;
 use log::{error, info, warn, LevelFilter};
 
+use crate::get_ip_version::get_ip_version;
 use crate::ip_version::IpVersion;
 use crate::stun_client::subscribe_to_stun;
 use crate::subscription_view_response::SubscriptionPeer;
@@ -64,15 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     info!("v0.1.1");
-    let ip_version_str = &args[2];
-    let ip_version = match ip_version_str.as_str() {
-        "ipv4" => IpVersion::Ipv4,
-        "ipv6" => IpVersion::Ipv6,
-        _ => {
-            error!("invalid ip version: {}", ip_version_str);
-            return Ok(());
-        }
-    };
+    let ip_version = get_ip_version().ok_or("failed get_ip_version()")?;
     let socket = match ip_version {
         IpVersion::Ipv4 => std::net::UdpSocket::bind("0.0.0.0:0"),
         IpVersion::Ipv6 => std::net::UdpSocket::bind("[::]:0"),

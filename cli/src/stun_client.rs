@@ -17,6 +17,6 @@ pub async fn subscribe_to_stun(
         .unwrap();
 
     let subscription_id = subscription_response.value.subscription_id;
-    info!("subscribed to stun subscription_id={}", subscription_id);
+    info!("subscribed to stun subscription_id = {}", subscription_id);
     return Ok(subscription_id);
 }
