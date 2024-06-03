@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::thread::available_parallelism;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Tunnel {
     socket: std::net::UdpSocket,
@@ -84,11 +84,11 @@ impl Tunnel {
                 let from_tunnel_ack_sender_clone = from_tunnel_ack_sender.clone();
                 tokio::spawn(async move {
                     let mut to_thread_receiver = to_thread_receiver;
-                    info!("hello, {:?}", std::thread::current().id());
 
                     let mut to_outbound_senders = HashMap::new();
                     tokio::join!(
                         async {
+                            // handle local client_data and remote server_data
                             let mut server_futures = Vec::new();
                             for port_settings in outbound_servers_port_settings {
                                 let (to_outbound_server_sender, to_outbound_server_receiver) =
@@ -112,11 +112,14 @@ impl Tunnel {
                             e
                         }),
                         async {
+                            // handle remote client_data and local server_data
+                            let before =  std::thread::current().id();
                             loop {
                                 let datagram = to_thread_receiver
                                     .recv()
                                     .await
                                     .ok_or("failed to_thread_receiver.recv()")?;
+                                info!("received at {:?}, before: {:?}", std::thread::current().id(),before);
                                 print!("{:?}", datagram);
                             }
                             Ok::<(), String>(())
@@ -146,8 +149,12 @@ impl Tunnel {
             outbound_servers_port_settings.push(*port_settings)
         }
 
+        let mut to_outbound_senders = HashMap::new();
+        let to_tunnel_sender_clone = to_tunnel_sender.clone();
+        let from_tunnel_ack_sender_clone = from_tunnel_ack_sender.clone();
         tokio::join!(
             async {
+                // handle tunnel
                 Self::tunnel_handler(
                     &tokio_socket,
                     to_tunnel_receiver,
@@ -163,15 +170,39 @@ impl Tunnel {
                 e
             }),
             async {
-                let mut receiver = main_receiver.unwrap();
-                info!("hello from main, {:?}", std::thread::current().id());
+                // handle local client_data and remote server_data
+                let mut server_futures = Vec::new();
                 for port_settings in outbound_servers_port_settings {
-                    // OutboundServer::start(port_settings).await;
+                    let (to_outbound_server_sender, to_outbound_server_receiver) =
+                        tokio::sync::mpsc::channel::<ControlDatagram>(1024);
+                    to_outbound_senders.insert(
+                        (port_settings.host_port, port_settings.protocol),
+                        to_outbound_server_sender,
+                    );
+                    server_futures.push(OutboundServer::start(
+                        port_settings,
+                        to_outbound_server_receiver,
+                        to_tunnel_sender_clone.clone(),
+                        from_tunnel_ack_sender_clone.clone(),
+                    ));
                 }
+                futures::future::join_all(server_futures).await;
+                Ok::<(), String>(())
+            }
+            .map_err(|e| {
+                error!("{e}");
+                e
+            }),
+            async {
+                // handle remote client_data and local server_data
+                let mut receiver = main_receiver.unwrap();
                 loop {
-                    match receiver.recv().await {
-                        _ => {}
-                    }
+                    let datagram = receiver
+                        .recv()
+                        .await
+                        .ok_or("failed to_thread_receiver.recv()")?;
+                    info!("received at {:?}", std::thread::current().id());
+                    print!("{:?}", datagram);
                 }
                 Ok::<(), String>(())
             }
@@ -514,30 +545,80 @@ impl Tunnel {
     ) {
         let senders_length = threads_senders.len();
         let mut next_thread_sender_index = (outbound_servers.len() + 1) % senders_length;
-        let mut inbound_clients = HashMap::new();
-        let (result1, result2) = tokio::join!(
+        let mut inbound_clients_mutex =
+            Mutex::new(HashMap::<(u16, u16, Protocol), InboundClient>::new());
+        let (_, result1, result2) = tokio::join!(
             async {
+                let mut interval = tokio::time::interval(Duration::from_secs(20));
                 loop {
-                    match to_tunnel_receiver.recv().await {
-                        None => {
-                            warn!("tunnel closed");
-                            break;
+                    interval.tick().await;
+                    let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
+                    let total_clients = inbound_clients.len();
+                    if total_clients > 0{
+                        info!("Running stopped clients cleanup");
+                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|format!("{e}"))?.as_secs();
+                        const TIMEOUT_IN_SECONDS: u64 = 30;
+                        let mut to_remove = Vec::new();
+                        for (key,client) in inbound_clients.iter(){
+                            info!("{} - {} = {} ",now,client.last_download_activity.load(Ordering::Relaxed),now - client.last_download_activity.load(Ordering::Relaxed));
+                            if now - client.last_download_activity.load(Ordering::Relaxed) > TIMEOUT_IN_SECONDS{
+                                let mut content = HashMap::new();
+                                content.insert(String::from("hostPort"), key.0.to_string());
+                                content.insert(String::from("hostClientPort"), key.1.to_string());
+                                content.insert(String::from("protocol"), match key.2{Protocol::Tcp => {"tcp".to_string()}Protocol::Udp => {"udp".to_string()}});
+                                client.sender.send(ControlDatagram{
+                                    version: -1,
+                                    r#type: "close".to_string(),
+                                    content,
+                                }).await.map_err(|e|format!("{e}"))?;
+                                to_remove.push(key.clone());
+                            }
+                        }
+                        for key in &to_remove{
+                            inbound_clients.remove(key);
+                        }
+                        info!("previous clients = {}; cleared = {}; current clients = {}",total_clients,to_remove.len(), inbound_clients.len())
+                    }
+                }
+                Ok::<(),String>(())
+            }
+            .map_err(|e| {
+                error!("tunnel_handler.join.0: {e}");
+                e
+            }),
+        async {
+        loop {
+            match to_tunnel_receiver.recv().await {
+                None => {
+                    warn!("tunnel closed");
+                    break;
                         }
                         Some(datagram) => {
+                            let r#type = datagram.r#type.clone();
+                            let id = datagram
+                                .content
+                                .get("id")
+                                .and_then(|id| { Some(format!("{{id:{id}}}")) })
+                                .unwrap_or(String::from(""));
                             let fragments = ControlDatagram::fragments(datagram)?;
                             Self::send_datagram(tokio_socket, &fragments[0]).await?;
                             Self::send_datagram(tokio_socket, &fragments[1]).await?;
+                            info!(
+                                "🎁 SENT IN FRAGMENTS {}{}",
+                                r#type,
+                                id,
+                            );
                         },
                     }
                 }
                 Ok::<(), Box<dyn Error>>(())
             }
-           .map_err(|e| {
-                error!("tunnel_handler.join.0: {e}");
+            .map_err(|e| {
+                error!("tunnel_handler.join.1: {e}");
                 e
             }),
             async {
-                    let mut buffer = Vec::with_capacity(65535);
+                let mut buffer = Vec::with_capacity(65535);
                 let mut fragment_handler = FragmentHandler::new();
                 loop {
                     buffer.clear();
@@ -615,7 +696,7 @@ impl Tunnel {
                                         "client_data" => {
                                             let future = async {
                                                 let remote_host_port: u16 =
-                                                    datagram.content["hostClientPort"].parse()?;
+                                                    datagram.content["hostPort"].parse()?;
                                                 let remote_client_port: u16 =
                                                     datagram.content["hostClientPort"].parse()?;
                                                 let remote_protocol: Protocol =
@@ -625,10 +706,12 @@ impl Tunnel {
                                                     remote_client_port,
                                                     remote_protocol,
                                                 );
+                                                let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
                                                 if !inbound_clients.contains_key(&key) {
                                                     let sender = threads_senders
                                                         [next_thread_sender_index]
                                                         .clone();
+                                                    info!("new client thread({next_thread_sender_index})");
                                                     next_thread_sender_index =
                                                         (next_thread_sender_index + 1)
                                                             % senders_length;
@@ -644,7 +727,7 @@ impl Tunnel {
                                                 }
                                                 let inbound_client = &inbound_clients[&key];
                                                 inbound_client.last_download_activity.store(
-                                                    Instant::now().elapsed().as_secs(),
+                                                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                                                     Ordering::Relaxed,
                                                 );
                                                 inbound_client.sender.send(datagram).await?;
@@ -720,7 +803,7 @@ impl Tunnel {
                 Ok::<(), Box<dyn Error>>(())
             }
            .map_err(|e| {
-                error!("tunnel_handler.join.1: {e}");
+                error!("tunnel_handler.join.2: {e}");
                 e
             })
         );
@@ -805,15 +888,27 @@ impl Tunnel {
         datagram: &ControlDatagram,
     ) -> Result<(), Box<dyn Error>> {
         tokio_socket.send(&datagram.to_vec()?).await?;
-        info!(
-            " ⃤ SENT {}{}",
-            datagram.r#type,
-            datagram
-                .content
-                .get("id")
-                .and_then(|id| { Some(format!("{{id:{id}}}")) })
-                .unwrap_or(String::from(""))
-        );
+        if datagram.r#type == "fragment" {
+            info!(
+                " ⃤ SENT fragment({}/{})",
+                datagram
+                    .content
+                    .get("index")
+                    .and_then(|index| Some(index.parse::<isize>().and_then(|i| Ok(i + 1))))
+                    .unwrap_or(Ok(-1))?,
+                datagram.content.get("length").unwrap_or(&String::from(""))
+            );
+        } else {
+            info!(
+                " ⃤ SENT {}{}",
+                datagram.r#type,
+                datagram
+                    .content
+                    .get("id")
+                    .and_then(|id| { Some(format!("{{id:{id}}}")) })
+                    .unwrap_or(String::from(""))
+            );
+        }
         Ok(())
     }
 }

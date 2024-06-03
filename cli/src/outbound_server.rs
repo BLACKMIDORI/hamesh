@@ -42,7 +42,7 @@ impl OutboundServer {
         from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
     ) -> Result<(), String> {
         info!(
-            "{:?}:{:?}/{:?} {:?}",
+            "{}:{}/{}",
             port_settings.host_port,
             port_settings.remote_host_port,
             match port_settings.protocol {
@@ -53,7 +53,6 @@ impl OutboundServer {
                     "udp"
                 }
             },
-            std::thread::current().id()
         );
         // hold at least one receiver in order to not close the channel
         let mut from_tunnel_ack_receiver = from_tunnel_ack_subscriber.subscribe();
