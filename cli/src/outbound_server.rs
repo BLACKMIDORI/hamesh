@@ -14,38 +14,25 @@ use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tracing_subscriber::fmt::format;
 
 pub struct OutboundServer {
-    local_host_port: u16,
-    pub remote_host_port: u16,
-    pub remote_protocol: Protocol,
-    pub to_server_thread_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
+    port_settings: PortSettings,
 }
 
 impl OutboundServer {
-    pub fn new(
-        local_host_port: u16,
-        remote_host_port: u16,
-        remote_protocol: Protocol,
-        to_server_thread_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
-    ) -> OutboundServer {
-        OutboundServer {
-            local_host_port,
-            remote_host_port,
-            remote_protocol,
-            to_server_thread_sender,
-        }
+    pub fn new(port_settings: PortSettings) -> OutboundServer {
+        OutboundServer { port_settings }
     }
 
     pub async fn start(
-        port_settings: PortSettings,
+        self,
         to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
         from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
     ) -> Result<(), String> {
         info!(
             "{}:{}/{}",
-            port_settings.host_port,
-            port_settings.remote_host_port,
-            match port_settings.protocol {
+            self.port_settings.host_port,
+            self.port_settings.remote_host_port,
+            match self.port_settings.protocol {
                 Protocol::Tcp => {
                     "tcp"
                 }
@@ -66,7 +53,7 @@ impl OutboundServer {
             Ok::<(), String>(())
         });
         Self::start_socket(
-            port_settings,
+            &self,
             to_server_receiver,
             from_server_sender,
             from_tunnel_ack_subscriber,
@@ -80,20 +67,22 @@ impl OutboundServer {
     }
 
     async fn start_socket(
-        port_settings: PortSettings,
+        &self,
         to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
         from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
     ) -> Result<(), String> {
         let address = match get_ip_version().ok_or("failed get_ip_version()")? {
-            IpVersion::Ipv4 => {
-                SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), port_settings.host_port)
-            }
-            IpVersion::Ipv6 => {
-                SocketAddr::new(IpAddr::from(Ipv6Addr::LOCALHOST), port_settings.host_port)
-            }
+            IpVersion::Ipv4 => SocketAddr::new(
+                IpAddr::from(Ipv4Addr::LOCALHOST),
+                self.port_settings.host_port,
+            ),
+            IpVersion::Ipv6 => SocketAddr::new(
+                IpAddr::from(Ipv6Addr::LOCALHOST),
+                self.port_settings.host_port,
+            ),
         };
-        match port_settings.protocol {
+        match self.port_settings.protocol {
             Protocol::Tcp => {
                 let server = TcpListener::bind(address)
                     .await
@@ -127,7 +116,7 @@ impl OutboundServer {
         server: TcpListener,
         mut to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
-        mut from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
+        from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
     ) -> Result<(), String> {
         let (to_local_clients_sender, _) = tokio::sync::broadcast::channel(1024);
         // let mut to_local_client_senders: HashMap<u16,tokio::sync::mpsc::Sender<ControlDatagram>> = HashMap::new();
@@ -154,6 +143,7 @@ impl OutboundServer {
                     let host_port = server_address.port();
                     let (client_stream, client_address) =
                         server.accept().await.map_err(|e| format!("{:?}", e))?;
+                    let local_client_port = client_address.port();
                     let (mut client_stream_reader, mut client_stream_writer) =
                         client_stream.into_split();
 
@@ -165,13 +155,17 @@ impl OutboundServer {
 
                         tokio::join!(
                             async {
-                                let mut sequence: u64 = 0;
+                                let mut sequence: u32 = 0;
                                 let mut buff = Vec::with_capacity(65535);
                                 loop {
+                                    if stopped.load(Ordering::Relaxed) {
+                                        break;
+                                    }
                                     let size = client_stream_reader
                                         .read_buf(&mut buff)
                                         .await
                                         .map_err(|e| format!("{:?}", e))?;
+                                    info!("👀 read {}b",size);
                                     if size == 0 {
                                         stopped.store(true, Ordering::Relaxed);
                                         info!(
@@ -185,9 +179,10 @@ impl OutboundServer {
                                         "tcp_client_{host_port}_{host_client_port}_{sequence}"
                                     );
                                     let encoded_data = base64::encode(&buff[..size]);
+                                    buff.clear();
                                     let client_data_datagram = ControlDatagram::client_data(
                                         id.as_str(),
-                                        sequence,
+                                        sequence as u32,
                                         ClientDataSettings {
                                             protocol: Protocol::Tcp,
                                             host_port,
@@ -218,9 +213,9 @@ impl OutboundServer {
 
                                     let mut interval =
                                         tokio::time::interval(Duration::from_millis(50));
-                                    // The first tick completes immediately
-                                    interval.tick().await;
                                     loop {
+                                        // The first tick completes immediately
+                                        interval.tick().await;
                                         if ack_received.is_finished() {
                                             break;
                                         }
@@ -228,37 +223,49 @@ impl OutboundServer {
                                             .send(client_data_datagram.clone())
                                             .await
                                             .map_err(|e| format!("{:?}", e))?;
-                                        interval.tick().await;
                                     }
-                                    sequence += 1;
+                                    (sequence,_) = sequence.overflowing_add(1);
                                 }
                                 Ok::<(), String>(())
                             }
                             .map_err(|e| {
-                                error!("{}", e);
+                                stopped.store(true, Ordering::Relaxed);
+                                error!("OutboundServer.tcp_accept().join.0: {e}");
                                 e
                             }),
                             async {
+                                let mut next_sequence: u32 = 0;
                                 loop {
                                     if stopped.load(Ordering::Relaxed) {
                                         break;
                                     }
-                                    // TODO: use simple channel for each client instead broadcast
                                     let datagram = to_local_clients_receiver
                                         .recv()
                                         .await
                                         .map_err(|e| format!("{:?}", e))?;
+                                    // TODO: use simple channel for each client instead broadcast
+                                    let server_remote_host_client_port = datagram.content.get("remoteHostClientPort").ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?.parse::<u16>().map_err(|e|format!("{e}"))?;
+                                    if server_remote_host_client_port != local_client_port {
+                                        continue;
+                                    }
+                                    let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
+                                    if received_sequence != next_sequence {
+                                        continue;
+                                    }
+                                    let data_base64 = &datagram.content["base64"];
+                                    let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
                                     client_stream_writer
-                                        .write_all(
-                                            &*datagram.to_vec().map_err(|e| format!("{:?}", e))?,
-                                        )
+                                        .write_all(&data)
                                         .await
-                                        .map_err(|e| format!("{:?}", e))?
+                                        .map_err(|e| format!("{:?}", e))?;
+                                     info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
+                                    (next_sequence,_) = next_sequence.overflowing_add(1);
                                 }
                                 Ok::<(), String>(())
                             }
                             .map_err(|e| {
-                                error!("{}", e);
+                                stopped.store(true, Ordering::Relaxed);
+                                error!("OutboundServer.tcp_accept().join.1: {e}");
                                 e
                             }),
                         );

@@ -69,7 +69,7 @@ impl InputClient {
                             ack_sender.clone(),
                         ));
                         let reader_handler = tokio::spawn(async move {
-                            let mut sequence: u64 = 0;
+                            let mut sequence: u32 = 0;
                             let mut received_zero_bytes = false;
                             loop {
                                 let id =
@@ -302,7 +302,7 @@ impl InputClient {
                                     )
                                 });
                                 let reader_handler = tokio::spawn(async move {
-                                    let mut sequence: u64 = 0;
+                                    let mut sequence: u32 = 0;
                                     let mut received_zero_bytes = false;
                                     loop {
                                         let id = format!(

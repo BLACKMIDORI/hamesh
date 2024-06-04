@@ -138,7 +138,7 @@ impl OutputServer {
                                         ack_sender.clone(),
                                     ));
                                     let reader_handler = tokio::spawn(async move {
-                                        let mut sequence: u64 = 0;
+                                        let mut sequence: u32 = 0;
                                         let mut received_zero_bytes = false;
                                         loop {
                                             let id = format!("tcp_client_{host_port}_{host_client_port}_{sequence}");
@@ -395,7 +395,7 @@ impl OutputServer {
                             )
                         });
                         tokio::spawn(async move {
-                            let mut sequence: u64 = 0;
+                            let mut sequence: u32 = 0;
                             loop {
                                 match server_socket_receiver.recv().await {
                                     Some((buff, size, udp_client)) => {

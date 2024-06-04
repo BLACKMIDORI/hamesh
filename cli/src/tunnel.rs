@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::thread::available_parallelism;
@@ -40,117 +40,16 @@ impl Tunnel {
 
         self.perform_handshake(&tokio_socket).await;
         let outbound_matches = self.exchange_port_settings(&tokio_socket).await;
-        let mut last_outbound_match_handled = None;
 
-        let default_parallelism_approx = available_parallelism().unwrap().get();
-        let outbound_server_per_thread =
-            outbound_matches.len().div_ceil(default_parallelism_approx);
         let (to_tunnel_sender, to_tunnel_receiver) =
             tokio::sync::mpsc::channel::<ControlDatagram>(1024);
         let (from_tunnel_ack_sender, _) = tokio::sync::broadcast::channel::<String>(1024);
-        let mut to_thread_senders = Vec::with_capacity(default_parallelism_approx);
-        let mut servers = HashMap::new();
-        let mut main_receiver = None;
-        for i in 0..default_parallelism_approx {
-            let (to_thread_sender, to_thread_receiver) =
-                tokio::sync::mpsc::channel::<ControlDatagram>(1024);
-            let to_outbound_server_thread_sender = to_thread_sender.clone();
-            to_thread_senders.push(to_thread_sender);
-
-            if i == 0 {
-                main_receiver = Some(to_thread_receiver);
-            } else {
-                let mut outbound_servers_port_settings = Vec::new();
-                for i_match in 0..outbound_server_per_thread {
-                    last_outbound_match_handled =
-                        Some((i - 1) * outbound_server_per_thread + i_match);
-                    match outbound_matches.get(last_outbound_match_handled.unwrap()) {
-                        None => {}
-                        Some(port_settings) => {
-                            let outbound_server = self.create_outbound_server(
-                                port_settings,
-                                to_outbound_server_thread_sender.clone(),
-                            );
-                            let outbound_server_key = (
-                                outbound_server.remote_host_port,
-                                outbound_server.remote_protocol,
-                            );
-                            servers.insert(outbound_server_key, outbound_server);
-                            outbound_servers_port_settings.push(*port_settings)
-                        }
-                    }
-                }
-                let to_tunnel_sender_clone = to_tunnel_sender.clone();
-                let from_tunnel_ack_sender_clone = from_tunnel_ack_sender.clone();
-                tokio::spawn(async move {
-                    let mut to_thread_receiver = to_thread_receiver;
-
-                    let mut to_outbound_senders = HashMap::new();
-                    tokio::join!(
-                        async {
-                            // handle local client_data and remote server_data
-                            let mut server_futures = Vec::new();
-                            for port_settings in outbound_servers_port_settings {
-                                let (to_outbound_server_sender, to_outbound_server_receiver) =
-                                    tokio::sync::mpsc::channel::<ControlDatagram>(1024);
-                                to_outbound_senders.insert(
-                                    (port_settings.host_port, port_settings.protocol),
-                                    to_outbound_server_sender,
-                                );
-                                server_futures.push(OutboundServer::start(
-                                    port_settings,
-                                    to_outbound_server_receiver,
-                                    to_tunnel_sender_clone.clone(),
-                                    from_tunnel_ack_sender_clone.clone(),
-                                ));
-                            }
-                            futures::future::join_all(server_futures).await;
-                            Ok::<(), String>(())
-                        }
-                        .map_err(|e| {
-                            error!("{e}");
-                            e
-                        }),
-                        async {
-                            // handle remote client_data and local server_data
-                            let before =  std::thread::current().id();
-                            loop {
-                                let datagram = to_thread_receiver
-                                    .recv()
-                                    .await
-                                    .ok_or("failed to_thread_receiver.recv()")?;
-                                info!("received at {:?}, before: {:?}", std::thread::current().id(),before);
-                                print!("{:?}", datagram);
-                            }
-                            Ok::<(), String>(())
-                        }
-                        .map_err(|e| {
-                            error!("{e}");
-                            e
-                        })
-                    );
-                });
-            }
-        }
-
-        let outbound_match_start_index = last_outbound_match_handled
-            .and_then(|i| Some(i + 1))
-            .unwrap_or(0);
-        let mut outbound_servers_port_settings = Vec::new();
-        for i in outbound_match_start_index..outbound_matches.len() {
-            let port_settings = &outbound_matches[i];
-            let outbound_server = self
-                .create_outbound_server(port_settings, to_thread_senders.first().unwrap().clone());
-            let outbound_server_key = (
-                outbound_server.remote_host_port,
-                outbound_server.remote_protocol,
-            );
-            servers.insert(outbound_server_key, outbound_server);
-            outbound_servers_port_settings.push(*port_settings)
-        }
+        let (from_tunnel_client_data_sender, mut from_tunnel_client_data_receiver) =
+            tokio::sync::mpsc::channel::<ControlDatagram>(1024);
+        let (from_tunnel_server_data_sender, mut from_tunnel_server_data_receiver) =
+            tokio::sync::mpsc::channel::<ControlDatagram>(1024);
 
         let mut to_outbound_senders = HashMap::new();
-        let to_tunnel_sender_clone = to_tunnel_sender.clone();
         let from_tunnel_ack_sender_clone = from_tunnel_ack_sender.clone();
         tokio::join!(
             async {
@@ -159,57 +58,208 @@ impl Tunnel {
                     &tokio_socket,
                     to_tunnel_receiver,
                     from_tunnel_ack_sender,
-                    &to_thread_senders,
-                    servers,
+                    from_tunnel_client_data_sender,
+                    from_tunnel_server_data_sender,
                 )
                 .await;
                 Ok::<(), String>(())
             }
             .map_err(|e| {
-                error!("{e}");
+                error!("start.join.0: {e}");
                 e
             }),
             async {
                 // handle local client_data and remote server_data
                 let mut server_futures = Vec::new();
-                for port_settings in outbound_servers_port_settings {
+                for port_settings in outbound_matches {
                     let (to_outbound_server_sender, to_outbound_server_receiver) =
                         tokio::sync::mpsc::channel::<ControlDatagram>(1024);
                     to_outbound_senders.insert(
                         (port_settings.host_port, port_settings.protocol),
                         to_outbound_server_sender,
                     );
-                    server_futures.push(OutboundServer::start(
-                        port_settings,
+                    server_futures.push(OutboundServer::new(port_settings).start(
                         to_outbound_server_receiver,
-                        to_tunnel_sender_clone.clone(),
+                        to_tunnel_sender.clone(),
                         from_tunnel_ack_sender_clone.clone(),
                     ));
                 }
-                futures::future::join_all(server_futures).await;
+                tokio::join!(futures::future::join_all(server_futures), async {
+                    loop {
+                        let server_data = from_tunnel_server_data_receiver
+                            .recv()
+                            .await
+                            .ok_or("failed from_tunnel_server_data_receiver.recv()")?;
+                        let local_outbound_server_port: u16 =
+                            server_data.content["remoteHostPort"].parse().map_err(|e|format!("{e}"))?;
+                        let local_protocol: Protocol =
+                            server_data.content["protocol"].parse()?;
+                        let key =
+                            (local_outbound_server_port, local_protocol);
+                        match to_outbound_senders.get(&key) {
+                            None => {
+                                warn!("received a server_data for unknown outbound server: {local_outbound_server_port}/{local_protocol}")
+                            }
+                            Some(outbound_sender) => {
+                                outbound_sender
+                                .send(server_data)
+                                .await
+                                .map_err(|e|{format!("{e}")})?;
+                            }
+                        }
+                    }
+                    Ok::<(), String>(())
+                });
                 Ok::<(), String>(())
             }
             .map_err(|e| {
-                error!("{e}");
+                error!("start.join.1: {e}");
                 e
             }),
             async {
                 // handle remote client_data and local server_data
-                let mut receiver = main_receiver.unwrap();
-                loop {
-                    let datagram = receiver
-                        .recv()
-                        .await
-                        .ok_or("failed to_thread_receiver.recv()")?;
-                    info!("received at {:?}", std::thread::current().id());
-                    print!("{:?}", datagram);
-                }
-                Ok::<(), String>(())
+                let mut inbound_clients_mutex = Mutex::new(HashMap::<
+                    (u16, u16, Protocol),
+                    (tokio::sync::mpsc::Sender<ControlDatagram>, AtomicU64),
+                >::new());
+                tokio::join!(
+                    async {
+                        const ONE_HOUR_IN_SECONDS : u64 = 3600;
+                        const TWO_HOURS_IN_SECONDS : u64 = 2 * ONE_HOUR_IN_SECONDS;
+                        let mut interval = tokio::time::interval(Duration::from_secs(ONE_HOUR_IN_SECONDS));
+                        loop {
+                            interval.tick().await;
+                            let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
+                            let total_clients = inbound_clients.len();
+                            if total_clients > 0 {
+                                info!("Running stopped clients cleanup");
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_err(|e| format!("{e}"))?
+                                    .as_secs();
+                                const TIMEOUT_IN_SECONDS: u64 = TWO_HOURS_IN_SECONDS;
+                                let mut to_remove = Vec::new();
+                                for (key, (inbound_client_sender, last_download_activity)) in
+                                    inbound_clients.iter()
+                                {
+                                    if now - last_download_activity.load(Ordering::Relaxed)
+                                        > TIMEOUT_IN_SECONDS
+                                    {
+                                        let mut content = HashMap::new();
+                                        content.insert(String::from("hostPort"), key.0.to_string());
+                                        content.insert(
+                                            String::from("hostClientPort"),
+                                            key.1.to_string(),
+                                        );
+                                        content.insert(
+                                            String::from("protocol"),
+                                            match key.2 {
+                                                Protocol::Tcp => "tcp".to_string(),
+                                                Protocol::Udp => "udp".to_string(),
+                                            },
+                                        );
+                                        inbound_client_sender
+                                            .send(ControlDatagram {
+                                                version: -1,
+                                                r#type: "close".to_string(),
+                                                content,
+                                            })
+                                            .await
+                                            .map_err(|e| format!("{e}"))?;
+                                        to_remove.push(key.clone());
+                                    }
+                                }
+                                for key in &to_remove {
+                                    inbound_clients.remove(key);
+                                }
+                                info!(
+                                    "previous clients = {}; cleared = {}; current clients = {}",
+                                    total_clients,
+                                    to_remove.len(),
+                                    inbound_clients.len()
+                                )
+                            }
+                        }
+                        Ok::<(), String>(())
+                    }
+                    .map_err(|e| {
+                        error!("start.join.2.join.0: {e}");
+                        e
+                    }),
+                    async {
+                        let (inbound_port_settings,_)=Self::get_settings();
+                        loop {
+                            let datagram = from_tunnel_client_data_receiver
+                                .recv()
+                                .await
+                                .ok_or("failed from_tunnel_client_data_receiver.recv()")?;
+                            let remote_host_port: u16 = datagram.content["hostPort"]
+                                .parse()
+                                .map_err(|e| format!("{e}"))?;
+                            let remote_client_port: u16 = datagram.content["hostClientPort"]
+                                .parse()
+                                .map_err(|e| format!("{e}"))?;
+                            let remote_protocol: Protocol = datagram.content["protocol"]
+                                .parse()
+                                .map_err(|e| format!("{e}"))?;
+
+                            let port_settings = match inbound_port_settings.iter().find(|settings|{settings.protocol == remote_protocol && settings.remote_host_port == remote_host_port}){
+                                None => {
+                                warn!(
+                                        "[SKIPPED] Datagram does not match any inbound settings: {}/{}",
+                                        remote_host_port,
+                                        match remote_protocol{Protocol::Tcp => {"tcp"}Protocol::Udp => {"udp"}},
+                                    );
+                                continue;
+                                }
+                                Some(port_settings) => {port_settings}
+                            };
+
+                            let key = (remote_host_port, remote_client_port, remote_protocol);
+                            let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
+                            if !inbound_clients.contains_key(&key) {
+                                if datagram.content["sequence"] != "0" {
+                                    warn!("[SKIPPED] Cannot find an existent inbound client and cannot create a new one since the datagram sequence is not 0.");
+                                    continue;
+                                }
+                                let (to_inbound_client_sender, to_inbound_client_receiver) =
+                                    tokio::sync::mpsc::channel::<ControlDatagram>(1024);
+                                inbound_clients
+                                    .insert(key, (to_inbound_client_sender, AtomicU64::new(0)));
+                                tokio::spawn(
+                                    InboundClient::new(port_settings.clone(),remote_client_port)
+                                    .start(
+                                        to_inbound_client_receiver,
+                                        to_tunnel_sender.clone(),
+                                        from_tunnel_ack_sender_clone.clone(),
+                                    ).map_err(|e|{
+                                        error!("InboundClient.start(): {}",e);
+                                        e
+                                    }),
+                                );
+                            }
+                            let (inbound_client_sender, last_download_activity) =
+                                &inbound_clients[&key];
+                            last_download_activity.store(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_err(|e| format!("{e}"))?
+                                    .as_secs(),
+                                Ordering::Relaxed,
+                            );
+                            inbound_client_sender
+                                .send(datagram)
+                                .await
+                                .map_err(|e| format!("{e}"))?;
+                        }
+                        Ok::<(), String>(())
+                    }
+                    .map_err(|e| {
+                        error!("start.join.2.join.1: {e}");
+                        e
+                    })
+                );
             }
-            .map_err(|e| {
-                error!("{e}");
-                e
-            })
         );
         Ok(())
     }
@@ -524,68 +574,14 @@ impl Tunnel {
         }
     }
 
-    fn create_outbound_server(
-        &self,
-        port_settings: &PortSettings,
-        to_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
-    ) -> OutboundServer {
-        OutboundServer::new(
-            port_settings.host_port,
-            port_settings.remote_host_port,
-            port_settings.protocol,
-            to_server_sender,
-        )
-    }
     async fn tunnel_handler(
         tokio_socket: &tokio::net::UdpSocket,
         mut to_tunnel_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_tunnel_ack_sender: tokio::sync::broadcast::Sender<String>,
-        threads_senders: &[tokio::sync::mpsc::Sender<ControlDatagram>],
-        outbound_servers: HashMap<(u16, Protocol), OutboundServer>,
+        from_tunnel_client_data_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
+        from_tunnel_server_data_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
     ) {
-        let senders_length = threads_senders.len();
-        let mut next_thread_sender_index = (outbound_servers.len() + 1) % senders_length;
-        let mut inbound_clients_mutex =
-            Mutex::new(HashMap::<(u16, u16, Protocol), InboundClient>::new());
-        let (_, result1, result2) = tokio::join!(
-            async {
-                let mut interval = tokio::time::interval(Duration::from_secs(20));
-                loop {
-                    interval.tick().await;
-                    let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
-                    let total_clients = inbound_clients.len();
-                    if total_clients > 0{
-                        info!("Running stopped clients cleanup");
-                        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e|format!("{e}"))?.as_secs();
-                        const TIMEOUT_IN_SECONDS: u64 = 30;
-                        let mut to_remove = Vec::new();
-                        for (key,client) in inbound_clients.iter(){
-                            info!("{} - {} = {} ",now,client.last_download_activity.load(Ordering::Relaxed),now - client.last_download_activity.load(Ordering::Relaxed));
-                            if now - client.last_download_activity.load(Ordering::Relaxed) > TIMEOUT_IN_SECONDS{
-                                let mut content = HashMap::new();
-                                content.insert(String::from("hostPort"), key.0.to_string());
-                                content.insert(String::from("hostClientPort"), key.1.to_string());
-                                content.insert(String::from("protocol"), match key.2{Protocol::Tcp => {"tcp".to_string()}Protocol::Udp => {"udp".to_string()}});
-                                client.sender.send(ControlDatagram{
-                                    version: -1,
-                                    r#type: "close".to_string(),
-                                    content,
-                                }).await.map_err(|e|format!("{e}"))?;
-                                to_remove.push(key.clone());
-                            }
-                        }
-                        for key in &to_remove{
-                            inbound_clients.remove(key);
-                        }
-                        info!("previous clients = {}; cleared = {}; current clients = {}",total_clients,to_remove.len(), inbound_clients.len())
-                    }
-                }
-                Ok::<(),String>(())
-            }
-            .map_err(|e| {
-                error!("tunnel_handler.join.0: {e}");
-                e
-            }),
+        let (result1, result2) = tokio::join!(
         async {
         loop {
             match to_tunnel_receiver.recv().await {
@@ -614,7 +610,7 @@ impl Tunnel {
                 Ok::<(), Box<dyn Error>>(())
             }
             .map_err(|e| {
-                error!("tunnel_handler.join.1: {e}");
+                error!("tunnel_handler.join.0: {e}");
                 e
             }),
             async {
@@ -690,82 +686,19 @@ impl Tunnel {
                                     }
                                     match datagram.r#type.as_str() {
                                         "ACK" => {
-                                            from_tunnel_ack_sender
-                                                .send(datagram.content["id"].clone()).map_err(|e|format!("ACK: {e}"))?;
+                                            match from_tunnel_ack_sender
+                                                .send(datagram.content["id"].clone()).map_err(|e|format!("ACK: {e}")){
+                                                Err(e) => {
+                                                    error!("{e}");
+                                                }
+                                                Ok(_) => {}
+                                            }
                                         }
                                         "client_data" => {
-                                            let future = async {
-                                                let remote_host_port: u16 =
-                                                    datagram.content["hostPort"].parse()?;
-                                                let remote_client_port: u16 =
-                                                    datagram.content["hostClientPort"].parse()?;
-                                                let remote_protocol: Protocol =
-                                                    datagram.content["protocol"].parse()?;
-                                                let key = (
-                                                    remote_host_port,
-                                                    remote_client_port,
-                                                    remote_protocol,
-                                                );
-                                                let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
-                                                if !inbound_clients.contains_key(&key) {
-                                                    let sender = threads_senders
-                                                        [next_thread_sender_index]
-                                                        .clone();
-                                                    info!("new client thread({next_thread_sender_index})");
-                                                    next_thread_sender_index =
-                                                        (next_thread_sender_index + 1)
-                                                            % senders_length;
-                                                    inbound_clients.insert(
-                                                        key,
-                                                        InboundClient::new(
-                                                            remote_host_port,
-                                                            remote_client_port,
-                                                            remote_protocol,
-                                                            sender,
-                                                        ),
-                                                    );
-                                                }
-                                                let inbound_client = &inbound_clients[&key];
-                                                inbound_client.last_download_activity.store(
-                                                    SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                                                    Ordering::Relaxed,
-                                                );
-                                                inbound_client.sender.send(datagram).await?;
-                                                Ok::<(), Box<dyn Error>>(())
-                                            };
-                                            future.await.map_err(|e|format!("client_data: {e}"))?;
+                                            from_tunnel_client_data_sender.send(datagram).await.map_err(|e|format!("client_data: {e}"))?;
                                         }
                                         "server_data" => {
-                                            let future = async {
-                                                let local_outbound_server_port: u16 =
-                                                    datagram.content["remoteHostPort"].parse()?;
-                                                let local_protocol: Protocol =
-                                                    datagram.content["protocol"].parse()?;
-                                                let key =
-                                                    (local_outbound_server_port, local_protocol);
-                                                match outbound_servers.get(&key) {
-                                                    None => {
-                                                        warn!("received a server_data for unknown outbound server: {local_outbound_server_port}/{local_protocol}")
-                                                    }
-                                                    Some(outbound_server) => {
-                                                        outbound_server
-                                                            .to_server_thread_sender
-                                                            .send(datagram)
-                                                            .await?;
-                                                    }
-                                                }
-                                                Ok::<(), Box<dyn Error>>(())
-                                            }
-                                            .map_err(|e| {
-                                                error!("{e}");
-                                                e
-                                            });
-                                            match future.await {
-                                                Err(error) => {
-                                                    error!("tunnel_handler(server_data): {error}");
-                                                }
-                                                _ => (),
-                                            }
+                                            from_tunnel_server_data_sender.send(datagram).await.map_err(|e|format!("server_data: {e}"))?;
                                         }
                                         "input_port" => {
                                             let remote_inbound_settings_result =
@@ -803,11 +736,10 @@ impl Tunnel {
                 Ok::<(), Box<dyn Error>>(())
             }
            .map_err(|e| {
-                error!("tunnel_handler.join.2: {e}");
+                error!("tunnel_handler.join.1: {e}");
                 e
             })
         );
-        let fragment_handler = FragmentHandler::new();
         match result1 {
             Ok(_) => {}
             Err(error) => {

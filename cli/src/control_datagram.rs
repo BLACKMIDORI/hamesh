@@ -79,7 +79,7 @@ impl ControlDatagram {
 
     pub fn client_data(
         id: &str,
-        sequence: u64,
+        sequence: u32,
         settings: ClientDataSettings,
         base64: &str,
     ) -> ControlDatagram {
@@ -109,7 +109,7 @@ impl ControlDatagram {
 
     pub fn server_data(
         id: &str,
-        sequence: u64,
+        sequence: u32,
         settings: ServerDataSettings,
         base64: &str,
     ) -> ControlDatagram {
