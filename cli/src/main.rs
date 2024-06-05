@@ -2,17 +2,13 @@ mod control_datagram;
 mod fragment_handler;
 mod get_ip_version;
 mod inbound_client;
-mod input_client;
 mod ip_version;
-mod outbound_handler;
 mod outbound_server;
-mod output_server;
 mod settings_models;
 mod stun_client;
 mod subscription_response;
 mod subscription_view_response;
 mod tunnel;
-mod tunnel_old;
 
 use bytes::Buf;
 use regex::Regex;
