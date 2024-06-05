@@ -229,7 +229,13 @@ async fn connect_peers(
 
 async fn read_peer_subscription() -> Result<String, io::Error> {
     info!("enter a peer subscription id:");
-    Ok(io::stdin().lines().next().unwrap().unwrap())
+    Ok(io::stdin()
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap()
+        .trim()
+        .to_string())
 }
 
 async fn http3get(

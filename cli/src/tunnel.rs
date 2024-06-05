@@ -12,7 +12,7 @@ use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::thread;
 use std::thread::available_parallelism;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -54,6 +54,17 @@ impl Tunnel {
         tokio::join!(
             async {
                 // handle tunnel
+                // hold at least one receiver in order to not close the channel
+                let mut from_tunnel_ack_receiver = from_tunnel_ack_sender_clone.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        from_tunnel_ack_receiver
+                            .recv()
+                            .await
+                            .map_err(|e| format!("{e}"))?;
+                    }
+                    Ok::<(), String>(())
+                });
                 Self::tunnel_handler(
                     &tokio_socket,
                     to_tunnel_receiver,
@@ -118,7 +129,7 @@ impl Tunnel {
             }),
             async {
                 // handle remote client_data and local server_data
-                let mut inbound_clients_mutex = Mutex::new(HashMap::<
+                let inbound_clients_mutex = Mutex::new(HashMap::<
                     (u16, u16, Protocol),
                     (tokio::sync::mpsc::Sender<ControlDatagram>, AtomicU64),
                 >::new());
@@ -129,7 +140,7 @@ impl Tunnel {
                         let mut interval = tokio::time::interval(Duration::from_secs(ONE_HOUR_IN_SECONDS));
                         loop {
                             interval.tick().await;
-                            let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
+                            let mut inbound_clients = inbound_clients_mutex.lock().await;
                             let total_clients = inbound_clients.len();
                             if total_clients > 0 {
                                 info!("Running stopped clients cleanup");
@@ -216,7 +227,7 @@ impl Tunnel {
                             };
 
                             let key = (remote_host_port, remote_client_port, remote_protocol);
-                            let mut inbound_clients = inbound_clients_mutex.lock().unwrap();
+                            let mut inbound_clients = inbound_clients_mutex.lock().await;
                             if !inbound_clients.contains_key(&key) {
                                 if datagram.content["sequence"] != "0" {
                                     warn!("[SKIPPED] Cannot find an existent inbound client and cannot create a new one since the datagram sequence is not 0.");
@@ -247,10 +258,10 @@ impl Tunnel {
                                     .as_secs(),
                                 Ordering::Relaxed,
                             );
-                            inbound_client_sender
+                            _ = inbound_client_sender
                                 .send(datagram)
                                 .await
-                                .map_err(|e| format!("{e}"))?;
+                                .map_err(|e| error!("inbound_client_sender.send(datagram): {e}"));
                         }
                         Ok::<(), String>(())
                     }

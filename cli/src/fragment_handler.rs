@@ -1,7 +1,6 @@
 use crate::control_datagram::ControlDatagram;
 use log::{info, warn};
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 pub struct FragmentHandler {
     fragments: HashMap<(i32, String), ControlDatagram>,

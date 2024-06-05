@@ -7,10 +7,10 @@ use log::{error, info};
 use std::collections::HashMap;
 use std::error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tracing_subscriber::fmt::format;
 
 pub struct OutboundServer {
@@ -41,17 +41,6 @@ impl OutboundServer {
                 }
             },
         );
-        // hold at least one receiver in order to not close the channel
-        let mut from_tunnel_ack_receiver = from_tunnel_ack_subscriber.subscribe();
-        tokio::spawn(async move {
-            loop {
-                from_tunnel_ack_receiver
-                    .recv()
-                    .await
-                    .map_err(|e| format!("{e}"))?;
-            }
-            Ok::<(), String>(())
-        });
         Self::start_socket(
             &self,
             to_server_receiver,
@@ -84,7 +73,7 @@ impl OutboundServer {
         };
         match self.port_settings.protocol {
             Protocol::Tcp => {
-                let server = TcpListener::bind(address)
+                let server = tokio::net::TcpListener::bind(address)
                     .await
                     .map_err(|e| format!("{:?}", e))?;
                 info!(
@@ -100,20 +89,21 @@ impl OutboundServer {
                 .await?;
             }
             Protocol::Udp => {
-                let server = UdpSocket::bind(address)
+                let server = tokio::net::UdpSocket::bind(address)
                     .await
                     .map_err(|e| format!("{:?}", e))?;
                 info!(
                     "listening on {}/udp",
                     server.local_addr().map_err(|e| format!("{:?}", e))?
                 );
+                Self::handle_udp(server, to_server_receiver, from_server_sender).await?;
             }
         };
         Ok(())
     }
 
     async fn tcp_accept(
-        server: TcpListener,
+        server: tokio::net::TcpListener,
         mut to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
         from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
@@ -152,7 +142,6 @@ impl OutboundServer {
                     let from_tunnel_ack_subscriber_clone = from_tunnel_ack_subscriber.clone();
                     tokio::spawn(async move {
                         let mut stopped = AtomicBool::new(false);
-
                         tokio::join!(
                             async {
                                 let mut sequence: u32 = 0;
@@ -182,7 +171,7 @@ impl OutboundServer {
                                     buff.clear();
                                     let client_data_datagram = ControlDatagram::client_data(
                                         id.as_str(),
-                                        sequence as u32,
+                                        sequence,
                                         ClientDataSettings {
                                             protocol: Protocol::Tcp,
                                             host_port,
@@ -279,5 +268,103 @@ impl OutboundServer {
             })
         );
         Ok(())
+    }
+
+    async fn handle_udp(
+        server_socket: tokio::net::UdpSocket,
+        mut to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
+        from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
+    ) -> Result<(), String> {
+        let server_address = server_socket.local_addr().map_err(|e| format!("{:?}", e))?;
+        let host_port = server_address.port();
+        let mut buff = Vec::with_capacity(65535);
+        let clients_mutex = Mutex::new(HashMap::new());
+        tokio::join!(
+            async {
+                loop {
+                    let (size, local_client_socket_address) = server_socket
+                        .recv_buf_from(&mut buff)
+                        .await
+                        .map_err(|e| format!("{e}"))?;
+                    let host_client_port = local_client_socket_address.port();
+                    let mut clients= clients_mutex.lock().await;
+                    if !clients.contains_key(&host_client_port) {
+                        clients.insert(host_client_port, (local_client_socket_address,AtomicU32::new(0),AtomicU32::new(0)));
+                    }
+                    info!("👀 read {}b", size);
+                    if size == 0 {
+                        clients.remove(&host_client_port);
+                        info!("disconnected from {}: {}", server_address, host_client_port);
+                        break;
+                    }
+                    let (_,sequence_atomic,_) = clients.get(&host_client_port).ok_or("invalid clients.get(&local_client_socket)")?;
+                    let sequence = sequence_atomic.load(Ordering::Relaxed);
+                    let id = format!("udp_client_{host_port}_{host_client_port}_{sequence}");
+                    let encoded_data = base64::encode(&buff[..size]);
+                    buff.clear();
+                    let client_data_datagram = ControlDatagram::client_data(
+                        id.as_str(),
+                        sequence,
+                        ClientDataSettings {
+                            protocol: Protocol::Udp,
+                            host_port,
+                            host_client_port,
+                        },
+                        encoded_data.as_str(),
+                    );
+                    from_server_sender
+                    .send(client_data_datagram.clone())
+                    .await
+                    .map_err(|e| format!("{:?}", e))?;
+                    let (new_sequence, _) = sequence.overflowing_add(1);
+                    sequence_atomic.store(new_sequence,Ordering::Relaxed);
+                }
+                Ok::<(),String>(())
+            }.map_err(|e|{
+                format!("OutboundServer.handle_up.join.0: {e}");
+                e
+            }),
+            async {
+                loop{
+                    let datagram = to_server_receiver
+                    .recv()
+                    .await
+                    .ok_or("invalid to_server_receiver.recv()")?;
+                    // TODO: use simple channel for each client instead broadcast
+                    let server_remote_host_client_port = datagram.content.get("remoteHostClientPort").ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?.parse::<u16>().map_err(|e|format!("{e}"))?;
+
+                    let mut clients= clients_mutex.lock().await;
+                    let found = clients.get(&server_remote_host_client_port);
+                    let (local_client_socket_address,_, next_sequence_atomic) = match found {
+                        None => {
+                            continue;
+                        }
+                        Some(atomic) => {atomic}
+                    };
+                    let next_sequence = next_sequence_atomic.load(Ordering::Relaxed);
+                    let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
+                    // sequence doesn't matter for udp
+                    // and there is no resend mechanism in the other side
+                    // if received_sequence != next_sequence {
+                    //     continue;
+                    // }
+                    let data_base64 = &datagram.content["base64"];
+                    let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
+                    server_socket
+                    .send_to(&data, local_client_socket_address)
+                    .await
+                    .map_err(|e| format!("{:?}", e))?;
+                    info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
+                    let (new_next_sequence, _) = next_sequence.overflowing_add(1);
+                    next_sequence_atomic.store(new_next_sequence,Ordering::Relaxed);
+                }
+                Ok::<(),String>(())
+            }
+            .map_err(|e|{
+                format!("OutboundServer.handle_up.join.0: {e}");
+                e
+            })
+        );
+        Ok::<(),String>(())
     }
 }

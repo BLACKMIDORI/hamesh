@@ -28,7 +28,7 @@ impl InboundClient {
         from_inbound_client_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
         from_tunnel_ack_subscriber: tokio::sync::broadcast::Sender<String>,
     ) -> Result<(), String> {
-        let address = match get_ip_version().ok_or("failed get_ip_version()")? {
+        let local_server_address = match get_ip_version().ok_or("failed get_ip_version()")? {
             IpVersion::Ipv4 => SocketAddr::new(
                 IpAddr::from(Ipv4Addr::LOCALHOST),
                 self.port_settings.host_port,
@@ -44,10 +44,13 @@ impl InboundClient {
 
         match self.port_settings.protocol {
             Protocol::Tcp => {
-                let client = TcpStream::connect(address)
+                let client = TcpStream::connect(local_server_address)
                     .await
                     .map_err(|e| format!("{:?}", e))?;
-                info!("new client at {host_port} {}/tcp",client.local_addr().map_err(|e|format!("{e}"))?);
+                info!(
+                    "new client at {host_port} {}/tcp",
+                    client.local_addr().map_err(|e| format!("{e}"))?
+                );
                 let client_address = client.local_addr().unwrap();
                 let host_client_port = client_address.port();
                 let (mut client_stream_reader, mut client_stream_writer) = client.into_split();
@@ -63,7 +66,7 @@ impl InboundClient {
                             let datagram = to_inbound_client_receiver
                                 .recv()
                                 .await
-                                .ok_or("failed to_server_receiver.recv()")?;
+                                .ok_or("failed  to_inbound_client_receiver.recv()")?;
                             if datagram.r#type == "close" {
                                 stopped.store(true, Ordering::Relaxed);
                                 break;
@@ -110,7 +113,7 @@ impl InboundClient {
                             buff.clear();
                             let server_data_datagram = ControlDatagram::server_data(
                                 id.as_str(),
-                                sequence as u32,
+                                sequence,
                                 ServerDataSettings {
                                     protocol: Protocol::Tcp,
                                     remote_host_port,
@@ -163,10 +166,108 @@ impl InboundClient {
                 );
             }
             Protocol::Udp => {
-                let server = UdpSocket::bind(address)
+                let local_client_address =
+                    match get_ip_version().ok_or("failed get_ip_version()")? {
+                        IpVersion::Ipv4 => SocketAddr::new(IpAddr::from(Ipv4Addr::LOCALHOST), 0),
+                        IpVersion::Ipv6 => SocketAddr::new(IpAddr::from(Ipv6Addr::LOCALHOST), 0),
+                    };
+                let local_server_client_socket = UdpSocket::bind(local_client_address)
                     .await
                     .map_err(|e| format!("{:?}", e))?;
-                warn!("UDP unimplemented")
+                local_server_client_socket
+                    .connect(local_server_address)
+                    .await
+                    .map_err(|e| format!("{e}"))?;
+                let local_client_address = local_server_client_socket.local_addr().map_err(|e| format!("{e}"))?;
+                info!(
+                    "new client at {host_port} {}/udp",
+                    local_client_address
+                );
+                let host_client_port =local_client_address.port();
+                let mut stopped = AtomicBool::new(false);
+                tokio::join!(
+                    async {
+                        let mut next_sequence: u32 = 0;
+                        loop {
+                            if stopped.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let datagram = to_inbound_client_receiver
+                                .recv()
+                                .await
+                                .ok_or("failed to_inbound_client_receiver.recv()")?;
+                            if datagram.r#type == "close" {
+                                stopped.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
+                            // sequence doesn't matter for udp
+                            // and there is no resend mechanism in the other side
+                            // if received_sequence != next_sequence {
+                            //     continue;
+                            // }
+                            let data_base64 = &datagram.content["base64"];
+                            let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
+                            local_server_client_socket
+                                .send(&data)
+                                .await
+                                .map_err(|e| format!("{:?}", e))?;
+                            info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
+                            (next_sequence,_) = next_sequence.overflowing_add(1);
+                        }
+                        Ok::<(), String>(())
+                    }
+                    .map_err(|e| {
+                        stopped.store(true, Ordering::Relaxed);
+                        error!("InboundClient writer: {}", e);
+                        e
+                    }),
+                    async {
+                        let mut sequence: u32 = 0;
+                        let mut buff = Vec::with_capacity(65535);
+                        loop {
+                            if stopped.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let size = local_server_client_socket
+                                .recv_buf(&mut buff)
+                                .await
+                                .map_err(|e| format!("{:?}", e))?;
+                            info!("👀 read {}b",size);
+                            if size == 0 {
+                                stopped.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            let id =
+                                format!("udp_server_{host_port}_{host_client_port}_{remote_host_port}_{remote_host_client_port}_{sequence}");
+                            let encoded_data = base64::encode(&buff[..size]);
+                            buff.clear();
+                            let server_data_datagram = ControlDatagram::server_data(
+                                id.as_str(),
+                                sequence,
+                                ServerDataSettings {
+                                    protocol: Protocol::Udp,
+                                    remote_host_port,
+                                    remote_host_client_port,
+                                },
+                                encoded_data.as_str(),
+                            );
+
+                            from_inbound_client_sender
+                            .send(server_data_datagram.clone())
+                            .await
+                            .map_err(|e| format!("{:?}", e))?;
+
+                            (sequence,_) = sequence.overflowing_add(1);
+                        }
+                        Ok::<(), String>(())
+                    }
+                    .map_err(|e| {
+                        stopped.store(true, Ordering::Relaxed);
+                        error!("InboundClient reader: {}", e);
+                        e
+                    })
+                );
             }
         };
         Ok::<(), String>(())
