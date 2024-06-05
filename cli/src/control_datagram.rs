@@ -29,15 +29,6 @@ impl ControlDatagram {
             content: HashMap::new(),
         }
     }
-    pub fn ack_old(id: &str) -> ControlDatagram {
-        let mut content = HashMap::new();
-        content.insert("id".to_string(), id.to_string());
-        ControlDatagram {
-            version: 1,
-            r#type: "ACK".to_string(),
-            content,
-        }
-    }
     pub fn ack(datagram: &ControlDatagram) -> ControlDatagram {
         let mut content = HashMap::new();
         content.insert(

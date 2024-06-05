@@ -3,19 +3,15 @@ use crate::fragment_handler::FragmentHandler;
 use crate::inbound_client::InboundClient;
 use crate::outbound_server::OutboundServer;
 use crate::settings_models::{PortSettings, Protocol};
-use futures::future::err;
-use futures::{future, stream, TryFutureExt};
+use futures::{TryFutureExt};
 use log::{error, info, warn};
 use regex::Regex;
 use std::collections::HashMap;
 use std::error::Error;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
-use std::thread;
-use std::thread::available_parallelism;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub struct Tunnel {
     socket: std::net::UdpSocket,
@@ -51,7 +47,7 @@ impl Tunnel {
 
         let mut to_outbound_senders = HashMap::new();
         let from_tunnel_ack_sender_clone = from_tunnel_ack_sender.clone();
-        tokio::join!(
+        _ = tokio::join!(
             async {
                 // handle tunnel
                 // hold at least one receiver in order to not close the channel
@@ -95,7 +91,7 @@ impl Tunnel {
                         from_tunnel_ack_sender_clone.clone(),
                     ));
                 }
-                tokio::join!(futures::future::join_all(server_futures), async {
+                _ = tokio::join!(futures::future::join_all(server_futures), async {
                     loop {
                         let server_data = from_tunnel_server_data_receiver
                             .recv()
@@ -133,7 +129,7 @@ impl Tunnel {
                     (u16, u16, Protocol),
                     (tokio::sync::mpsc::Sender<ControlDatagram>, AtomicU64),
                 >::new());
-                tokio::join!(
+                _ = tokio::join!(
                     async {
                         const ONE_HOUR_IN_SECONDS : u64 = 3600;
                         const TWO_HOURS_IN_SECONDS : u64 = 2 * ONE_HOUR_IN_SECONDS;

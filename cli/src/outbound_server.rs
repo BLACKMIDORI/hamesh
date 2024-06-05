@@ -5,13 +5,11 @@ use crate::settings_models::{ClientDataSettings, PortSettings, Protocol};
 use futures::TryFutureExt;
 use log::{error, info};
 use std::collections::HashMap;
-use std::error;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing_subscriber::fmt::format;
 
 pub struct OutboundServer {
     port_settings: PortSettings,
@@ -110,7 +108,7 @@ impl OutboundServer {
     ) -> Result<(), String> {
         let (to_local_clients_sender, _) = tokio::sync::broadcast::channel(1024);
         // let mut to_local_client_senders: HashMap<u16,tokio::sync::mpsc::Sender<ControlDatagram>> = HashMap::new();
-        tokio::join!(
+        _ = tokio::join!(
             async {
                 loop {
                     let datagram = to_server_receiver
@@ -141,8 +139,8 @@ impl OutboundServer {
                     let mut to_local_clients_receiver = to_local_clients_sender.subscribe();
                     let from_tunnel_ack_subscriber_clone = from_tunnel_ack_subscriber.clone();
                     tokio::spawn(async move {
-                        let mut stopped = AtomicBool::new(false);
-                        tokio::join!(
+                        let stopped = AtomicBool::new(false);
+                        _ = tokio::join!(
                             async {
                                 let mut sequence: u32 = 0;
                                 let mut buff = Vec::with_capacity(65535);
@@ -279,7 +277,7 @@ impl OutboundServer {
         let host_port = server_address.port();
         let mut buff = Vec::with_capacity(65535);
         let clients_mutex = Mutex::new(HashMap::new());
-        tokio::join!(
+        _ = tokio::join!(
             async {
                 loop {
                     let (size, local_client_socket_address) = server_socket
@@ -333,7 +331,7 @@ impl OutboundServer {
                     // TODO: use simple channel for each client instead broadcast
                     let server_remote_host_client_port = datagram.content.get("remoteHostClientPort").ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?.parse::<u16>().map_err(|e|format!("{e}"))?;
 
-                    let mut clients= clients_mutex.lock().await;
+                    let clients= clients_mutex.lock().await;
                     let found = clients.get(&server_remote_host_client_port);
                     let (local_client_socket_address,_, next_sequence_atomic) = match found {
                         None => {
@@ -342,7 +340,7 @@ impl OutboundServer {
                         Some(atomic) => {atomic}
                     };
                     let next_sequence = next_sequence_atomic.load(Ordering::Relaxed);
-                    let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
+                    // let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
                     // sequence doesn't matter for udp
                     // and there is no resend mechanism in the other side
                     // if received_sequence != next_sequence {

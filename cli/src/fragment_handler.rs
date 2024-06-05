@@ -1,5 +1,5 @@
 use crate::control_datagram::ControlDatagram;
-use log::{info, warn};
+use log::{warn};
 use std::collections::HashMap;
 
 pub struct FragmentHandler {

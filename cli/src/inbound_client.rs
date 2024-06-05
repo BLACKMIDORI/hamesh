@@ -3,12 +3,12 @@ use crate::get_ip_version::get_ip_version;
 use crate::ip_version::IpVersion;
 use crate::settings_models::{PortSettings, Protocol, ServerDataSettings};
 use futures::TryFutureExt;
-use log::{error, info, warn};
+use log::{error, info};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 
 pub struct InboundClient {
     port_settings: PortSettings,
@@ -55,8 +55,8 @@ impl InboundClient {
                 let host_client_port = client_address.port();
                 let (mut client_stream_reader, mut client_stream_writer) = client.into_split();
 
-                let mut stopped = AtomicBool::new(false);
-                tokio::join!(
+                let stopped = AtomicBool::new(false);
+                _ = tokio::join!(
                     async {
                         let mut next_sequence: u32 = 0;
                         loop {
@@ -184,8 +184,8 @@ impl InboundClient {
                     local_client_address
                 );
                 let host_client_port =local_client_address.port();
-                let mut stopped = AtomicBool::new(false);
-                tokio::join!(
+                let stopped = AtomicBool::new(false);
+                _ = tokio::join!(
                     async {
                         let mut next_sequence: u32 = 0;
                         loop {
@@ -200,7 +200,7 @@ impl InboundClient {
                                 stopped.store(true, Ordering::Relaxed);
                                 break;
                             }
-                            let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
+                            // let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
                             // sequence doesn't matter for udp
                             // and there is no resend mechanism in the other side
                             // if received_sequence != next_sequence {
