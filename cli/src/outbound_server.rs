@@ -73,10 +73,11 @@ impl OutboundServer {
             Protocol::Tcp => {
                 let server = tokio::net::TcpListener::bind(address)
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| format!("{e}"))?;
                 info!(
                     "listening on {}/tcp",
-                    server.local_addr().map_err(|e| format!("{:?}", e))?
+                    server.local_addr()
+                    .map_err(|e| format!("{e}"))?
                 );
                 Self::tcp_accept(
                     server,
@@ -89,10 +90,11 @@ impl OutboundServer {
             Protocol::Udp => {
                 let server = tokio::net::UdpSocket::bind(address)
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| format!("{e}"))?;
                 info!(
                     "listening on {}/udp",
-                    server.local_addr().map_err(|e| format!("{:?}", e))?
+                    server.local_addr()
+                    .map_err(|e| format!("{e}"))?
                 );
                 Self::handle_udp(server, to_server_receiver, from_server_sender).await?;
             }
@@ -115,22 +117,26 @@ impl OutboundServer {
                         .recv()
                         .await
                         .ok_or("failed to_server_receiver.recv()")?;
-                    to_local_clients_sender
+                    _ = to_local_clients_sender
                         .send(datagram)
-                        .map_err(|e| format!("{:?}", e))?;
+                        .map_err(|e| error!("to_local_clients_sender.send(datagram): {e}"));
                 }
                 Ok::<(), String>(())
             }
             .map_err(|e| {
-                error!("{}", e);
+                error!("OutboundServer.tcp_accept().join.0: {e}");
                 e
             }),
             async {
                 loop {
-                    let server_address = server.local_addr().map_err(|e| format!("{:?}", e))?;
+                    let server_address = server
+                        .local_addr()
+                        .map_err(|e| format!("{e}"))?;
                     let host_port = server_address.port();
                     let (client_stream, client_address) =
-                        server.accept().await.map_err(|e| format!("{:?}", e))?;
+                        server.accept()
+                        .await
+                        .map_err(|e| format!("{e}"))?;
                     let local_client_port = client_address.port();
                     let (mut client_stream_reader, mut client_stream_writer) =
                         client_stream.into_split();
@@ -151,7 +157,7 @@ impl OutboundServer {
                                     let size = client_stream_reader
                                         .read_buf(&mut buff)
                                         .await
-                                        .map_err(|e| format!("{:?}", e))?;
+                                        .map_err(|e| format!("{e}"))?;
                                     info!("👀 read {}b",size);
                                     if size == 0 {
                                         stopped.store(true, Ordering::Relaxed);
@@ -185,7 +191,7 @@ impl OutboundServer {
                                                 let ack = ack_receiver
                                                     .recv()
                                                     .await
-                                                    .map_err(|e| format!("{:?}", e))?;
+                                                    .map_err(|e| format!("{e}"))?;
                                                 if ack == id {
                                                     break;
                                                 }
@@ -209,7 +215,7 @@ impl OutboundServer {
                                         from_server_sender_clone
                                             .send(client_data_datagram.clone())
                                             .await
-                                            .map_err(|e| format!("{:?}", e))?;
+                                            .map_err(|e| format!("{e}"))?;
                                     }
                                     (sequence,_) = sequence.overflowing_add(1);
                                 }
@@ -217,7 +223,7 @@ impl OutboundServer {
                             }
                             .map_err(|e| {
                                 stopped.store(true, Ordering::Relaxed);
-                                error!("OutboundServer.tcp_accept().join.0: {e}");
+                                error!("OutboundServer.tcp_accept().join.1.spawn.join.0: {e}");
                                 e
                             }),
                             async {
@@ -229,7 +235,7 @@ impl OutboundServer {
                                     let datagram = to_local_clients_receiver
                                         .recv()
                                         .await
-                                        .map_err(|e| format!("{:?}", e))?;
+                                        .map_err(|e| format!("{e}"))?;
                                     // TODO: use simple channel for each client instead broadcast
                                     let server_remote_host_client_port = datagram.content.get("remoteHostClientPort").ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?.parse::<u16>().map_err(|e|format!("{e}"))?;
                                     if server_remote_host_client_port != local_client_port {
@@ -241,10 +247,11 @@ impl OutboundServer {
                                     }
                                     let data_base64 = &datagram.content["base64"];
                                     let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
+                                     info!("📝 writing {}b (sequence = {next_sequence})",data.len());
                                     client_stream_writer
                                         .write_all(&data)
                                         .await
-                                        .map_err(|e| format!("{:?}", e))?;
+                                        .map_err(|e| format!("{e}"))?;
                                      info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
                                     (next_sequence,_) = next_sequence.overflowing_add(1);
                                 }
@@ -252,7 +259,7 @@ impl OutboundServer {
                             }
                             .map_err(|e| {
                                 stopped.store(true, Ordering::Relaxed);
-                                error!("OutboundServer.tcp_accept().join.1: {e}");
+                                error!("OutboundServer.tcp_accept().join.1.spawn.join.1: {e}");
                                 e
                             }),
                         );
@@ -261,7 +268,7 @@ impl OutboundServer {
                 Ok::<(), String>(())
             }
             .map_err(|e| {
-                error!("{}", e);
+                error!("OutboundServer.tcp_accept().join.1: {e}");
                 e
             })
         );
@@ -273,7 +280,9 @@ impl OutboundServer {
         mut to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
     ) -> Result<(), String> {
-        let server_address = server_socket.local_addr().map_err(|e| format!("{:?}", e))?;
+        let server_address = server_socket
+            .local_addr()
+            .map_err(|e| format!("{e}"))?;
         let host_port = server_address.port();
         let mut buff = Vec::with_capacity(65535);
         let clients_mutex = Mutex::new(HashMap::new());
@@ -313,7 +322,7 @@ impl OutboundServer {
                     from_server_sender
                     .send(client_data_datagram.clone())
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| format!("{e}"))?;
                     let (new_sequence, _) = sequence.overflowing_add(1);
                     sequence_atomic.store(new_sequence,Ordering::Relaxed);
                 }
@@ -348,10 +357,10 @@ impl OutboundServer {
                     // }
                     let data_base64 = &datagram.content["base64"];
                     let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
-                    server_socket
+                    _ = server_socket
                     .send_to(&data, local_client_socket_address)
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| error!("server_socket.send_to(&data, local_client_socket_address): {e}"));
                     info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
                     let (new_next_sequence, _) = next_sequence.overflowing_add(1);
                     next_sequence_atomic.store(new_next_sequence,Ordering::Relaxed);

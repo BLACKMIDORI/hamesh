@@ -46,7 +46,7 @@ impl InboundClient {
             Protocol::Tcp => {
                 let client = TcpStream::connect(local_server_address)
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| format!("{e}"))?;
                 info!(
                     "new client at {host_port} {}/tcp",
                     client.local_addr().map_err(|e| format!("{e}"))?
@@ -80,7 +80,7 @@ impl InboundClient {
                             client_stream_writer
                                 .write_all(&data)
                                 .await
-                                .map_err(|e| format!("{:?}", e))?;
+                                .map_err(|e| format!("{e}"))?;
                             info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
                             (next_sequence,_) = next_sequence.overflowing_add(1);
                         }
@@ -101,7 +101,7 @@ impl InboundClient {
                             let size = client_stream_reader
                                 .read_buf(&mut buff)
                                 .await
-                                .map_err(|e| format!("{:?}", e))?;
+                                .map_err(|e| format!("{e}"))?;
                             info!("👀 read {}b",size);
                             if size == 0 {
                                 stopped.store(true, Ordering::Relaxed);
@@ -129,7 +129,7 @@ impl InboundClient {
                                         let ack = ack_receiver
                                         .recv()
                                         .await
-                                        .map_err(|e| format!("{:?}", e))?;
+                                        .map_err(|e| format!("{e}"))?;
                                         if ack == id {
                                             break;
                                         }
@@ -152,7 +152,7 @@ impl InboundClient {
                                 from_inbound_client_sender
                                 .send(server_data_datagram.clone())
                                 .await
-                                .map_err(|e| format!("{:?}", e))?;
+                                .map_err(|e| format!("{e}"))?;
                             }
                             (sequence,_) = sequence.overflowing_add(1);
                         }
@@ -173,7 +173,7 @@ impl InboundClient {
                     };
                 let local_server_client_socket = UdpSocket::bind(local_client_address)
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| format!("{e}"))?;
                 local_server_client_socket
                     .connect(local_server_address)
                     .await
@@ -211,7 +211,7 @@ impl InboundClient {
                             local_server_client_socket
                                 .send(&data)
                                 .await
-                                .map_err(|e| format!("{:?}", e))?;
+                                .map_err(|e| format!("{e}"))?;
                             info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
                             (next_sequence,_) = next_sequence.overflowing_add(1);
                         }
@@ -232,7 +232,7 @@ impl InboundClient {
                             let size = local_server_client_socket
                                 .recv_buf(&mut buff)
                                 .await
-                                .map_err(|e| format!("{:?}", e))?;
+                                .map_err(|e| format!("{e}"))?;
                             info!("👀 read {}b",size);
                             if size == 0 {
                                 stopped.store(true, Ordering::Relaxed);
@@ -256,7 +256,7 @@ impl InboundClient {
                             from_inbound_client_sender
                             .send(server_data_datagram.clone())
                             .await
-                            .map_err(|e| format!("{:?}", e))?;
+                            .map_err(|e| format!("{e}"))?;
 
                             (sequence,_) = sequence.overflowing_add(1);
                         }
