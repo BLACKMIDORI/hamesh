@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Provide at least one --inbound or --outbound argument");
         return Ok(());
     }
-    info!("v0.2.1");
+    info!("v0.3.0");
     let ip_version = get_ip_version().ok_or("failed get_ip_version()")?;
     let socket = match ip_version {
         IpVersion::Ipv4 => std::net::UdpSocket::bind("0.0.0.0:0"),

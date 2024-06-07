@@ -29,6 +29,14 @@ impl ControlDatagram {
             content: HashMap::new(),
         }
     }
+
+    pub fn heart_beat() -> ControlDatagram {
+        ControlDatagram {
+            version: 1,
+            r#type: "heart_beat".to_string(),
+            content: HashMap::new(),
+        }
+    }
     pub fn ack(datagram: &ControlDatagram) -> ControlDatagram {
         let mut content = HashMap::new();
         content.insert(

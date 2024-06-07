@@ -266,7 +266,18 @@ impl Tunnel {
                         e
                     })
                 );
-            }
+            },
+            async {
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                let to_tunnel_sender = to_tunnel_sender.clone();
+                loop {
+                    interval.tick().await;
+                    _=to_tunnel_sender
+                    .send(ControlDatagram::heart_beat())
+                    .await
+                    .map_err(|e|error!("{e}"))
+                }
+            },
         );
         Ok(())
     }
@@ -722,7 +733,8 @@ impl Tunnel {
                                                 "UNMATCHED REMOTE INBOUND: {}",
                                                 remote_inbound_settings,
                                             );
-                                        }
+                                        },
+                                        "heart_beat"=>{},
                                         _ => {
                                             warn!(
                                                 "🔻 SKIPPED {}{}",
