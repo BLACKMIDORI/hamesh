@@ -3,6 +3,10 @@ name = "hamesh_cli"
 version = "0.3.0"
 edition = "2021"
 
+[lib]
+name = "hamesh"
+path = "src/main.rs"
+
 [[bin]]
 name = "hamesh_cli"
 path = "src/main.rs"

@@ -7,9 +7,9 @@ use log::{error, info};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tokio::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 pub struct OutboundServer {
     port_settings: PortSettings,
@@ -76,8 +76,7 @@ impl OutboundServer {
                     .map_err(|e| format!("{e}"))?;
                 info!(
                     "listening on {}/tcp",
-                    server.local_addr()
-                    .map_err(|e| format!("{e}"))?
+                    server.local_addr().map_err(|e| format!("{e}"))?
                 );
                 Self::tcp_accept(
                     server,
@@ -93,8 +92,7 @@ impl OutboundServer {
                     .map_err(|e| format!("{e}"))?;
                 info!(
                     "listening on {}/udp",
-                    server.local_addr()
-                    .map_err(|e| format!("{e}"))?
+                    server.local_addr().map_err(|e| format!("{e}"))?
                 );
                 Self::handle_udp(server, to_server_receiver, from_server_sender).await?;
             }
@@ -280,9 +278,7 @@ impl OutboundServer {
         mut to_server_receiver: tokio::sync::mpsc::Receiver<ControlDatagram>,
         from_server_sender: tokio::sync::mpsc::Sender<ControlDatagram>,
     ) -> Result<(), String> {
-        let server_address = server_socket
-            .local_addr()
-            .map_err(|e| format!("{e}"))?;
+        let server_address = server_socket.local_addr().map_err(|e| format!("{e}"))?;
         let host_port = server_address.port();
         let mut buff = Vec::with_capacity(65535);
         let clients_mutex = Mutex::new(HashMap::new());
@@ -294,9 +290,16 @@ impl OutboundServer {
                         .await
                         .map_err(|e| format!("{e}"))?;
                     let host_client_port = local_client_socket_address.port();
-                    let mut clients= clients_mutex.lock().await;
+                    let mut clients = clients_mutex.lock().await;
                     if !clients.contains_key(&host_client_port) {
-                        clients.insert(host_client_port, (local_client_socket_address,AtomicU32::new(0),AtomicU32::new(0)));
+                        clients.insert(
+                            host_client_port,
+                            (
+                                local_client_socket_address,
+                                AtomicU32::new(0),
+                                AtomicU32::new(0),
+                            ),
+                        );
                     }
                     info!("👀 read {}b", size);
                     if size == 0 {
@@ -304,7 +307,9 @@ impl OutboundServer {
                         info!("disconnected from {}: {}", server_address, host_client_port);
                         break;
                     }
-                    let (_,sequence_atomic,_) = clients.get(&host_client_port).ok_or("invalid clients.get(&local_client_socket)")?;
+                    let (_, sequence_atomic, _) = clients
+                        .get(&host_client_port)
+                        .ok_or("invalid clients.get(&local_client_socket)")?;
                     let sequence = sequence_atomic.load(Ordering::Relaxed);
                     let id = format!("udp_client_{host_port}_{host_client_port}_{sequence}");
                     let encoded_data = base64::encode(&buff[..size]);
@@ -320,33 +325,39 @@ impl OutboundServer {
                         encoded_data.as_str(),
                     );
                     from_server_sender
-                    .send(client_data_datagram.clone())
-                    .await
-                    .map_err(|e| format!("{e}"))?;
+                        .send(client_data_datagram.clone())
+                        .await
+                        .map_err(|e| format!("{e}"))?;
                     let (new_sequence, _) = sequence.overflowing_add(1);
-                    sequence_atomic.store(new_sequence,Ordering::Relaxed);
+                    sequence_atomic.store(new_sequence, Ordering::Relaxed);
                 }
-                Ok::<(),String>(())
-            }.map_err(|e|{
+                Ok::<(), String>(())
+            }
+            .map_err(|e| {
                 format!("OutboundServer.handle_up.join.0: {e}");
                 e
             }),
             async {
-                loop{
+                loop {
                     let datagram = to_server_receiver
-                    .recv()
-                    .await
-                    .ok_or("invalid to_server_receiver.recv()")?;
+                        .recv()
+                        .await
+                        .ok_or("invalid to_server_receiver.recv()")?;
                     // TODO: use simple channel for each client instead broadcast
-                    let server_remote_host_client_port = datagram.content.get("remoteHostClientPort").ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?.parse::<u16>().map_err(|e|format!("{e}"))?;
+                    let server_remote_host_client_port = datagram
+                        .content
+                        .get("remoteHostClientPort")
+                        .ok_or("invalid datagram.content.get(\"remoteHostClientPort\")")?
+                        .parse::<u16>()
+                        .map_err(|e| format!("{e}"))?;
 
-                    let clients= clients_mutex.lock().await;
+                    let clients = clients_mutex.lock().await;
                     let found = clients.get(&server_remote_host_client_port);
-                    let (local_client_socket_address,_, next_sequence_atomic) = match found {
+                    let (local_client_socket_address, _, next_sequence_atomic) = match found {
                         None => {
                             continue;
                         }
-                        Some(atomic) => {atomic}
+                        Some(atomic) => atomic,
                     };
                     let next_sequence = next_sequence_atomic.load(Ordering::Relaxed);
                     // let received_sequence = datagram.content.get("sequence").ok_or("invalid datagram.content.get(\"sequence\")")?.parse::<u32>().map_err(|e|format!("{e}"))?;
@@ -356,22 +367,24 @@ impl OutboundServer {
                     //     continue;
                     // }
                     let data_base64 = &datagram.content["base64"];
-                    let data = base64::decode(data_base64).map_err(|e|format!("{e}"))?;
+                    let data = base64::decode(data_base64).map_err(|e| format!("{e}"))?;
                     _ = server_socket
-                    .send_to(&data, local_client_socket_address)
-                    .await
-                    .map_err(|e| error!("server_socket.send_to(&data, local_client_socket_address): {e}"));
-                    info!("📝 wrote {}b (sequence = {next_sequence})",data.len());
+                        .send_to(&data, local_client_socket_address)
+                        .await
+                        .map_err(|e| {
+                            error!("server_socket.send_to(&data, local_client_socket_address): {e}")
+                        });
+                    info!("📝 wrote {}b (sequence = {next_sequence})", data.len());
                     let (new_next_sequence, _) = next_sequence.overflowing_add(1);
-                    next_sequence_atomic.store(new_next_sequence,Ordering::Relaxed);
+                    next_sequence_atomic.store(new_next_sequence, Ordering::Relaxed);
                 }
-                Ok::<(),String>(())
+                Ok::<(), String>(())
             }
-            .map_err(|e|{
+            .map_err(|e| {
                 format!("OutboundServer.handle_up.join.0: {e}");
                 e
             })
         );
-        Ok::<(),String>(())
+        Ok::<(), String>(())
     }
 }

@@ -1,5 +1,5 @@
 use std::fmt::Formatter;
-use std::hash::{Hash};
+use std::hash::Hash;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Eq, Hash)]

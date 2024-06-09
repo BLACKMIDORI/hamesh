@@ -3,15 +3,15 @@ use crate::fragment_handler::FragmentHandler;
 use crate::inbound_client::InboundClient;
 use crate::outbound_server::OutboundServer;
 use crate::settings_models::{PortSettings, Protocol};
-use futures::{TryFutureExt};
+use futures::TryFutureExt;
 use log::{error, info, warn};
 use regex::Regex;
 use std::collections::HashMap;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 pub struct Tunnel {
     socket: std::net::UdpSocket,
@@ -304,7 +304,7 @@ impl Tunnel {
                         break;
                     }
                     if !syn {
-                        Self::send_datagram(tokio_socket, &ControlDatagram::syn()).await?;
+                        Self::send_datagram(tokio_socket, ControlDatagram::syn()).await?;
                     }
                     interval.tick().await;
                 }
@@ -348,7 +348,7 @@ impl Tunnel {
                                     if datagram.r#type != "ACK" {
                                         Self::send_datagram(
                                             tokio_socket,
-                                            &ControlDatagram::ack(&datagram),
+                                            ControlDatagram::ack(&datagram),
                                         )
                                         .await?;
                                     }
@@ -425,7 +425,7 @@ impl Tunnel {
                         &format!("input_port_{}", port_settings),
                         port_settings,
                     );
-                    Self::send_datagram(tokio_socket, &datagram).await?;
+                    Self::send_datagram(tokio_socket, datagram).await?;
                     interval.tick().await;
                 }
                 Ok::<(), Box<dyn Error>>(())
@@ -483,7 +483,7 @@ impl Tunnel {
                                     if datagram.r#type != "ACK" {
                                         Self::send_datagram(
                                             tokio_socket,
-                                            &ControlDatagram::ack(&datagram),
+                                            ControlDatagram::ack(&datagram),
                                         )
                                         .await?;
                                     }
@@ -608,20 +608,7 @@ impl Tunnel {
                     break;
                         }
                         Some(datagram) => {
-                            let r#type = datagram.r#type.clone();
-                            let id = datagram
-                                .content
-                                .get("id")
-                                .and_then(|id| { Some(format!("{{id:{id}}}")) })
-                                .unwrap_or(String::from(""));
-                            let fragments = ControlDatagram::fragments(datagram)?;
-                            Self::send_datagram(tokio_socket, &fragments[0]).await?;
-                            Self::send_datagram(tokio_socket, &fragments[1]).await?;
-                            info!(
-                                "🎁 SENT IN FRAGMENTS {}{}",
-                                r#type,
-                                id,
-                            );
+                            Self::send_datagram(tokio_socket, datagram).await?;
                         },
                     }
                 }
@@ -661,7 +648,8 @@ impl Tunnel {
                                             received_datagram
                                             .content
                                             .get("length")
-                                            .unwrap_or(&String::from(""))
+                                            .and_then(|index|Some(index.parse::<isize>()))
+                                            .unwrap_or(Ok(-1))?
                                         );
                                     }else{
                                         info!(
@@ -698,7 +686,7 @@ impl Tunnel {
                                     if datagram.r#type != "ACK" {
                                         Self::send_datagram(
                                             tokio_socket,
-                                            &ControlDatagram::ack(&datagram),
+                                            ControlDatagram::ack(&datagram),
                                         )
                                         .await?;
                                     }
@@ -836,20 +824,12 @@ impl Tunnel {
 
     async fn send_datagram(
         tokio_socket: &tokio::net::UdpSocket,
-        datagram: &ControlDatagram,
+        datagram: ControlDatagram,
     ) -> Result<(), Box<dyn Error>> {
-        tokio_socket.send(&datagram.to_vec()?).await?;
-        if datagram.r#type == "fragment" {
-            info!(
-                " ⃤ SENT fragment({}/{})",
-                datagram
-                    .content
-                    .get("index")
-                    .and_then(|index| Some(index.parse::<isize>().and_then(|i| Ok(i + 1))))
-                    .unwrap_or(Ok(-1))?,
-                datagram.content.get("length").unwrap_or(&String::from(""))
-            );
-        } else {
+        const MAX_SIZE: u16 = 1400;
+        let data = datagram.to_vec()?;
+        if data.len() <= MAX_SIZE as usize {
+            tokio_socket.send(&data).await?;
             info!(
                 " ⃤ SENT {}{}",
                 datagram.r#type,
@@ -859,7 +839,33 @@ impl Tunnel {
                     .and_then(|id| { Some(format!("{{id:{id}}}")) })
                     .unwrap_or(String::from(""))
             );
+        } else {
+            let r#type = datagram.r#type.clone();
+            let id = datagram
+                .content
+                .get("id")
+                .and_then(|id| Some(format!("{{id:{id}}}")))
+                .unwrap_or(String::from(""));
+            let fragments = ControlDatagram::fragments(datagram, MAX_SIZE)?;
+            for fragment in fragments {
+                tokio_socket.send(&fragment.to_vec()?).await?;
+                info!(
+                    " ⃤ SENT fragment({}/{})",
+                    fragment
+                        .content
+                        .get("index")
+                        .and_then(|index| Some(index.parse::<isize>().and_then(|i| Ok(i + 1))))
+                        .unwrap_or(Ok(-1))?,
+                    fragment
+                        .content
+                        .get("length")
+                        .and_then(|index| Some(index.parse::<isize>()))
+                        .unwrap_or(Ok(-1))?
+                );
+            }
+            info!("🎁 SENT IN FRAGMENTS {}{}", r#type, id,);
         }
+
         Ok(())
     }
 }

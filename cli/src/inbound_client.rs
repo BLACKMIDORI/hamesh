@@ -178,12 +178,11 @@ impl InboundClient {
                     .connect(local_server_address)
                     .await
                     .map_err(|e| format!("{e}"))?;
-                let local_client_address = local_server_client_socket.local_addr().map_err(|e| format!("{e}"))?;
-                info!(
-                    "new client at {host_port} {}/udp",
-                    local_client_address
-                );
-                let host_client_port =local_client_address.port();
+                let local_client_address = local_server_client_socket
+                    .local_addr()
+                    .map_err(|e| format!("{e}"))?;
+                info!("new client at {host_port} {}/udp", local_client_address);
+                let host_client_port = local_client_address.port();
                 let stopped = AtomicBool::new(false);
                 _ = tokio::join!(
                     async {
