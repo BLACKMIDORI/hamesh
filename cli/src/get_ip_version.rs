@@ -1,4 +1,4 @@
-use crate::ip_version::IpVersion;
+use hamesh::ip_version::IpVersion;
 use log::error;
 
 pub fn get_ip_version() -> Option<IpVersion> {

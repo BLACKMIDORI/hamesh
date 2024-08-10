@@ -17,12 +17,16 @@ impl FragmentHandler {
         if content_type != "control_datagram" {
             warn!("cannot handle fragment content type = {content_type}");
         } else {
-            let index = fragment.content["index"].parse::<i32>().map_err(|e|{
-                error!("get_complete_datagram(let index): {e}")
-            }).ok().unwrap();
-            let length = fragment.content["length"].parse::<i32>().map_err(|e|{
-                error!("get_complete_datagram(let length): {e}")
-            }).ok().unwrap();
+            let index = fragment.content["index"]
+                .parse::<i32>()
+                .map_err(|e| error!("get_complete_datagram(let index): {e}"))
+                .ok()
+                .unwrap();
+            let length = fragment.content["length"]
+                .parse::<i32>()
+                .map_err(|e| error!("get_complete_datagram(let length): {e}"))
+                .ok()
+                .unwrap();
             let digest = fragment.content["digest"].clone();
             let key = (index, digest.clone());
             self.fragments.insert(key, fragment);
@@ -38,9 +42,9 @@ impl FragmentHandler {
                 }
                 full_data.push_str(&fragment_option.unwrap().content["data"]);
             }
-            let control_datagram = serde_json::from_str::<ControlDatagram>(&full_data).map_err(|e|{
-                error!("get_complete_datagram: error parsing: {full_data}\n{e}")
-            }).ok()?;
+            let control_datagram = serde_json::from_str::<ControlDatagram>(&full_data)
+                .map_err(|e| error!("get_complete_datagram: error parsing: {full_data}\n{e}"))
+                .ok()?;
             // Avoid possible hash conflict
             for i in 0..length {
                 self.fragments.remove(&(i, digest.clone()));
