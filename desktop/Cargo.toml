@@ -1,0 +1,16 @@
+[package]
+name = "hamesh_desktop"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "hamesh_desktop"
+path = "src/main.rs"
+
+[dependencies]
+hamesh = {path = "../core"}
+regex = "1.10.3"
+simple_logger = "4.3.3"
+log = "0.4.20"
+tokio = { version = "1.27", features = ["full"] }
+gtk = { git = "https://github.com/gtk-rs/gtk4-rs.git", package = "gtk4" }

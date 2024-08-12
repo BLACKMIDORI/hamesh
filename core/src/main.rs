@@ -7,6 +7,7 @@ pub mod settings_models;
 pub mod stun_client;
 pub mod subscription_response;
 pub mod subscription_view_response;
+pub mod version;
 pub mod tunnel;
 use bytes::Buf;
 use regex::Regex;

@@ -17,6 +17,7 @@ use hamesh::{connect_peers, get_peers, get_socket, get_subscription, read_peer_s
 use hamesh::stun_client::subscribe_to_stun;
 use hamesh::subscription_view_response::SubscriptionPeer;
 use hamesh::tunnel::Tunnel;
+use hamesh::version::VERSION;
 use simple_logger::SimpleLogger;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("Provide at least one --inbound or --outbound argument");
         return Ok(());
     }
-    info!("v0.3.0");
+    info!("v{}",VERSION);
     let ip_version = get_ip_version().ok_or("failed get_ip_version()")?;
     let socket = get_socket(ip_version).await;
     let peers_result = {
