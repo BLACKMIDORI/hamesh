@@ -14,14 +14,14 @@ pub struct ControlDatagram {
 }
 
 impl ControlDatagram {
-    pub fn from(size: usize, buffer: &[u8]) -> Result<ControlDatagram, Box<dyn Error>> {
-        let json_str = std::str::from_utf8(&buffer[..size])?;
-        let obj = serde_json::from_str::<ControlDatagram>(json_str)?;
+    pub fn from(size: usize, buffer: &[u8]) -> Result<ControlDatagram, String> {
+        let json_str = std::str::from_utf8(&buffer[..size]).map_err(|e|format!("{e}"))?;
+        let obj = serde_json::from_str::<ControlDatagram>(json_str).map_err(|e|format!("{e}"))?;
         Ok(obj)
     }
 
-    pub fn to_vec(&self) -> Result<Vec<u8>, Box<dyn Error>> {
-        Ok(serde_json::to_vec(self)?)
+    pub fn to_vec(&self) -> Result<Vec<u8>, String> {
+        Ok(serde_json::to_vec(self).map_err(|e|format!("{e}"))?)
     }
     pub fn syn() -> ControlDatagram {
         ControlDatagram {

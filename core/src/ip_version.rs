@@ -1,6 +1,7 @@
 use std::fmt::Formatter;
 use crate::settings_models::Protocol;
 
+#[derive(Clone)]
 pub enum IpVersion {
     Ipv4,
     Ipv6,

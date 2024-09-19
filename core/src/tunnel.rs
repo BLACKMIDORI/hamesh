@@ -32,7 +32,7 @@ impl Tunnel {
             dest_peer,
         }
     }
-    pub async fn start(&self) -> Result<(), Box<dyn Error>> {
+    pub async fn start(&self) -> Result<(), String> {
         let tokio_socket = self.connect().await?;
 
         self.perform_handshake(&tokio_socket).await;
@@ -296,12 +296,12 @@ impl Tunnel {
         Ok(())
     }
 
-    async fn connect(&self) -> Result<tokio::net::UdpSocket, Box<dyn Error>> {
-        let tokio_socket = tokio::net::UdpSocket::from_std(self.socket.try_clone()?)?;
+    async fn connect(&self) -> Result<tokio::net::UdpSocket, String> {
+        let tokio_socket = tokio::net::UdpSocket::from_std(self.socket.try_clone().map_err(|e|format!("{e}"))?).map_err(|e|format!("{e}"))?;
         let source_peer = self.source_peer;
         let dest_peer = self.dest_peer;
         info!("connecting {source_peer} <-> {dest_peer}");
-        tokio_socket.connect(self.dest_peer).await?;
+        tokio_socket.connect(self.dest_peer).await.map_err(|e|format!("{e}"))?;
         info!("connected!");
         Ok(tokio_socket)
     }
@@ -322,7 +322,7 @@ impl Tunnel {
                     }
                     interval.tick().await;
                 }
-                Ok::<(), Box<dyn Error>>(())
+                Ok::<(), String>(())
             }
             .map_err(|e| {
                 error!("{e}");
@@ -392,7 +392,7 @@ impl Tunnel {
                         }
                     };
                 }
-                Ok::<(), Box<dyn Error>>(())
+                Ok::<(), String>(())
             }
             .map_err(|e| {
                 error!("{e}");
@@ -442,7 +442,7 @@ impl Tunnel {
                     Self::send_datagram(tokio_socket, datagram).await?;
                     interval.tick().await;
                 }
-                Ok::<(), Box<dyn Error>>(())
+                Ok::<(), String>(())
             }
             .map_err(|e| {
                 error!("{e}");
@@ -569,7 +569,7 @@ impl Tunnel {
                     };
                 }
                 receiver_stopped_atomic.store(true, Ordering::Relaxed);
-                Ok::<Vec<PortSettings>, Box<dyn Error>>(outbound_matches)
+                Ok::<Vec<PortSettings>, String>(outbound_matches)
             }
             .map_err(|e| {
                 error!("{e}");
@@ -626,7 +626,7 @@ impl Tunnel {
                         },
                     }
                 }
-                Ok::<(), Box<dyn Error>>(())
+                Ok::<(), String>(())
             }
             .map_err(|e| {
                 error!("tunnel_handler.join.0: {e}");
@@ -658,12 +658,12 @@ impl Tunnel {
                                             .content
                                             .get("index")
                                             .and_then(|index|Some(index.parse::<isize>().and_then(|i|Ok(i+1))))
-                                            .unwrap_or(Ok(-1))?,
+                                            .unwrap_or(Ok(-1)).map_err(|e|format!("{e}"))?,
                                             received_datagram
                                             .content
                                             .get("length")
                                             .and_then(|index|Some(index.parse::<isize>()))
-                                            .unwrap_or(Ok(-1))?
+                                            .unwrap_or(Ok(-1)).map_err(|e|format!("{e}"))?
                                         );
                                     }else{
                                         info!(
@@ -754,7 +754,7 @@ impl Tunnel {
                         }
                     };
                 }
-                Ok::<(), Box<dyn Error>>(())
+                Ok::<(), String>(())
             }
            .map_err(|e| {
                 error!("tunnel_handler.join.1: {e}");
@@ -839,11 +839,11 @@ impl Tunnel {
     async fn send_datagram(
         tokio_socket: &tokio::net::UdpSocket,
         datagram: ControlDatagram,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), String> {
         const MAX_SIZE: u16 = 1400;
         let data = datagram.to_vec()?;
         if data.len() <= MAX_SIZE as usize {
-            tokio_socket.send(&data).await?;
+            tokio_socket.send(&data).await.map_err(|e|format!("{e}"))?;
             info!(
                 " ⃤ SENT {}{}",
                 datagram.r#type,
@@ -860,21 +860,21 @@ impl Tunnel {
                 .get("id")
                 .and_then(|id| Some(format!("{{id:{id}}}")))
                 .unwrap_or(String::from(""));
-            let fragments = ControlDatagram::fragments(datagram, MAX_SIZE)?;
+            let fragments = ControlDatagram::fragments(datagram, MAX_SIZE).map_err(|e|format!("{e}"))?;
             for fragment in fragments {
-                tokio_socket.send(&fragment.to_vec()?).await?;
+                tokio_socket.send(&fragment.to_vec()?).await.map_err(|e|format!("{e}"))?;
                 info!(
                     " ⃤ SENT fragment({}/{})",
                     fragment
                         .content
                         .get("index")
                         .and_then(|index| Some(index.parse::<isize>().and_then(|i| Ok(i + 1))))
-                        .unwrap_or(Ok(-1))?,
+                        .unwrap_or(Ok(-1)).map_err(|e|format!("{e}"))?,
                     fragment
                         .content
                         .get("length")
                         .and_then(|index| Some(index.parse::<isize>()))
-                        .unwrap_or(Ok(-1))?
+                        .unwrap_or(Ok(-1)).map_err(|e|format!("{e}"))?
                 );
             }
             info!("🎁 SENT IN FRAGMENTS {}{}", r#type, id,);

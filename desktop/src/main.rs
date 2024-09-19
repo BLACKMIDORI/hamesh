@@ -1,20 +1,30 @@
+extern crate alloc;
+
+mod forwarding_item;
 mod version;
 
+use crate::forwarding_item::ForwardingItem;
+use crate::version::VERSION as DESKTOP_VERSION;
 use gtk::glib::clone;
 use gtk::prelude::*;
-use gtk::{glib, Align, Application, ApplicationWindow, Box, Button, ButtonsType, ComboBox, ComboBoxText, Dialog, DialogFlags, Entry, Label, MessageDialog, MessageType, Orientation, ResponseType, Separator};
+use gtk::{
+    gio, glib, Align, Application, ApplicationWindow, Box, Button, ButtonsType, ComboBox,
+    ComboBoxText, Dialog, DialogFlags, Entry, Label, MessageDialog, MessageType, Orientation,
+    ResponseType, Separator,
+};
 use hamesh::ip_version::IpVersion;
 use hamesh::settings_models::Protocol;
-use log::{debug, error, info, trace, LevelFilter};
+use hamesh::version::VERSION;
+use log::{error, info, trace, warn, LevelFilter};
 use simple_logger::SimpleLogger;
 use std::num::ParseIntError;
-use hamesh::version::VERSION as VERSION;
-use crate::version::VERSION as DESKTOP_VERSION;
+use std::{process, thread};
+use std::time::Duration;
 
-// #[tokio::main]
-fn main() {
+#[tokio::main]
+async fn main() {
     SimpleLogger::new()
-        .with_level(LevelFilter::Debug)
+        .with_level(LevelFilter::Info)
         .init()
         .unwrap();
     // Create a new application with the builder pattern
@@ -29,8 +39,11 @@ fn main() {
 fn on_activate(application: &Application) {
     // … create a new window …
     let window = ApplicationWindow::new(application);
+    window.connect_close_request(|_| {
+        process::exit(0);
+    });
     window.set_title(Some("Hamesh Desktop"));
-    window.set_default_size(300, 500);
+    window.set_default_size(350, 500);
     let vbox = Box::new(Orientation::Vertical, 5);
     window.set_child(Some(&vbox));
     window.present();
@@ -40,11 +53,17 @@ fn on_activate(application: &Application) {
 
     let connections_box = Box::new(Orientation::Vertical, 5);
     let button = Button::with_label("Add Forwarding");
-    button.connect_clicked(clone!(@weak window, @weak connections_box => move|_|
+    button.connect_clicked(clone!(@weak window, @weak connections_box => move|_|{
+        let window1 = window.clone();
         on_add_forwarding(window, move |ip_version, protocol, local_port, remote_port| {
-            let subscription_id = Label::new(Some(format!("⏳ {} {}:{}/{}",ip_version, local_port,remote_port,protocol).as_str()));
-            connections_box.append(&subscription_id);
+        let window1 = window1.clone();
+            let item = ForwardingItem::new(window1, ip_version, protocol, local_port, remote_port);
+            connections_box.append(&item.widget);
+            glib::MainContext::default().spawn_local(async move{
+                item.start().await;
+            });
         })
+    }
     ));
     vbox.append(&button);
 
@@ -63,7 +82,9 @@ fn on_activate(application: &Application) {
     let bottom_hbox = Box::new(Orientation::Horizontal, 5);
     bottom_vbox.append(&bottom_hbox);
 
-    let hyperlink_label = Label::new(Some("<a href=\"https://hamesh.blackmidori.com\">hamesh.blackmidori.com</a>"));
+    let hyperlink_label = Label::new(Some(
+        "<a href=\"https://hamesh.blackmidori.com\">hamesh.blackmidori.com</a>",
+    ));
     hyperlink_label.set_use_markup(true);
     bottom_hbox.append(&hyperlink_label);
 
@@ -71,7 +92,9 @@ fn on_activate(application: &Application) {
     bottom_spacer.set_hexpand(true);
     bottom_hbox.append(&bottom_spacer);
 
-    let version_label = Label::new(Some(format!("v{DESKTOP_VERSION} (core v{VERSION})").as_str()));
+    let version_label = Label::new(Some(
+        format!("v{DESKTOP_VERSION} (core v{VERSION})").as_str(),
+    ));
     bottom_hbox.append(&version_label);
 
     window.set_child(Some(&vbox));
@@ -120,7 +143,6 @@ fn on_add_forwarding<F: Fn(IpVersion, Protocol, u16, u16) + 'static>(
 
     // Run the dialog and handle user response
     // Connect response signal to the dialog
-    let dialog_clone = dialog.clone();
     dialog.connect_response(move |dialog, response| match response {
         ResponseType::Ok => {
             let (local_port_u16, remote_port_u16) = match (
@@ -168,7 +190,7 @@ fn on_add_forwarding<F: Fn(IpVersion, Protocol, u16, u16) + 'static>(
         }
         ResponseType::DeleteEvent => {}
         fallback => {
-            debug!("Cannot handle {fallback}");
+            warn!("Cannot handle {fallback}");
         }
     });
     dialog.present();

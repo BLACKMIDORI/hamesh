@@ -205,7 +205,7 @@ pub async fn connect_peers(
     socket: std::net::UdpSocket,
     source_peer: &SubscriptionPeer,
     dest_peer: &SubscriptionPeer,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), String> {
     let source_address;
     let dest_address;
     if source_peer.address.contains(".") {
@@ -253,15 +253,9 @@ async fn http3get(client_endpoint: &mut Endpoint, url: &str) -> Result<String, S
 
     let port = auth.port_u16().unwrap_or(443);
 
-    let args: Vec<String> = std::env::args().collect();
-    let ip_version_str = &args[2];
-    let ip_version = match ip_version_str.as_str() {
-        "ipv4" => IpVersion::Ipv4,
-        "ipv6" => IpVersion::Ipv6,
-        _ => {
-            error!("invalid ip version: {}", ip_version_str);
-            IpVersion::Ipv6
-        }
+    let ip_version =match client_endpoint.local_addr().unwrap(){
+        SocketAddr::V4(_) => {IpVersion::Ipv4}
+        SocketAddr::V6(_) => {IpVersion::Ipv6}
     };
     let addresses = tokio::net::lookup_host((auth.host(), port))
         .await
